@@ -1,7 +1,11 @@
 name: MIXER
+
 on:
+  workflow_dispatch:            # запуск вручную из вкладки Actions
+  push:
+    branches: [ main ]          # запуск при любом коммите в main
   repository_dispatch:
-    types: [mix_audio]   # будем вызывать из Make через GitHub API
+    types: [mix_audio]          # запуск из Make через GitHub API
 
 jobs:
   build:
@@ -25,7 +29,6 @@ jobs:
           BG_URL:    ${{ secrets.BG_URL }}
         run: |
           VOICE_URL=$(jq -r '.voice_url' payload.json)
-
           curl -L "$VOICE_URL" -o voice.mp3
           curl -L "$INTRO_URL" -o intro.mp3
           curl -L "$OUTRO_URL" -o outro.mp3
@@ -33,17 +36,15 @@ jobs:
 
       - name: Mix voice + background (loop bg, adjust volumes)
         env:
-          BG_DB: "-18"     # громкость подложки (можешь менять)
-          VOICE_DB: "0"    # усиление/ослабление голоса
+          BG_DB: "-18"      # громкость подложки
+          VOICE_DB: "0"     # усиление/ослабление голоса
         run: |
-          # зацикливаем подложку, смешиваем с голосом, режем по длине голоса
           ffmpeg -y -stream_loop -1 -i bg.mp3 -i voice.mp3 \
             -filter_complex "[0:a]volume=${BG_DB}dB[bg];[bg][1:a]amix=inputs=2:duration=shortest:dropout_transition=2[m];[m]volume=${VOICE_DB}dB[out]" \
             -map "[out]" -shortest -ar 44100 -b:a 128k voice_mix.mp3
 
       - name: Concatenate intro + mix + outro
         run: |
-          # попытка быстрым concat (copy), если не получится — через фильтр
           printf "file 'intro.mp3'\nfile 'voice_mix.mp3'\nfile 'outro.mp3'\n" > list.txt
           ffmpeg -y -f concat -safe 0 -i list.txt -c copy result.mp3 || \
           ffmpeg -y -i intro.mp3 -i voice_mix.mp3 -i outro.mp3 \
