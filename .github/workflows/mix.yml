@@ -29,41 +29,52 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
+      # ====== РЕЗОЛВ ВХОДНЫХ ДАННЫХ (с защитой JOB_ID) ======
       - name: Resolve inputs (VOICE_URL / JOB_ID / MAKE_CALLBACK_URL)
         env:
           SECRET_CALLBACK: ${{ secrets.MAKE_CALLBACK_URL }}
         run: |
           set -e
+
+          # 1) Берём значения из источника события
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Ручной запуск
-            [ -n "${{ github.event.inputs.voice_url }}" ] && echo "VOICE_URL=${{ github.event.inputs.voice_url }}" >> $GITHUB_ENV
-            if [ -n "${{ github.event.inputs.job_id }}" ]; then
-              echo "JOB_ID=${{ github.event.inputs.job_id }}" >> $GITHUB_ENV
-            else
-              echo "JOB_ID=$(date +%s)-$RANDOM" >> $GITHUB_ENV
-            fi
-            echo "MAKE_CALLBACK_URL=$SECRET_CALLBACK" >> $GITHUB_ENV
+            [ -n "${{ github.event.inputs.voice_url }}" ] && VOICE_URL="${{ github.event.inputs.voice_url }}"
+            [ -n "${{ github.event.inputs.job_id }}" ] && JOB_ID="${{ github.event.inputs.job_id }}"
+            MAKE_CALLBACK_URL="$SECRET_CALLBACK"
           else
-            # repository_dispatch
-            [ -n "${{ github.event.client_payload.voice_url }}" ] && echo "VOICE_URL=${{ github.event.client_payload.voice_url }}" >> $GITHUB_ENV
-            if [ -n "${{ github.event.client_payload.job_id }}" ]; then
-              echo "JOB_ID=${{ github.event.client_payload.job_id }}" >> $GITHUB_ENV
-            else
-              echo "JOB_ID=$(date +%s)-$RANDOM" >> $GITHUB_ENV
-            fi
+            [ -n "${{ github.event.client_payload.voice_url }}" ] && VOICE_URL="${{ github.event.client_payload.voice_url }}"
+            [ -n "${{ github.event.client_payload.job_id }}" ] && JOB_ID="${{ github.event.client_payload.job_id }}"
             if [ -n "${{ github.event.client_payload.make_callback_url }}" ]; then
-              echo "MAKE_CALLBACK_URL=${{ github.event.client_payload.make_callback_url }}" >> $GITHUB_ENV
+              MAKE_CALLBACK_URL="${{ github.event.client_payload.make_callback_url }}"
             else
-              echo "MAKE_CALLBACK_URL=$SECRET_CALLBACK" >> $GITHUB_ENV
+              MAKE_CALLBACK_URL="$SECRET_CALLBACK"
             fi
           fi
+
+          # 2) Санитизируем/страхуем JOB_ID
+          JOB_ID="$(printf "%s" "${JOB_ID:-}" | tr -d '\r' | xargs | tr -cd '[:alnum:]_-')"
+          if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "prokis_jobs" ]; then
+            JOB_ID="$(date +%s)-$RANDOM"
+          fi
+
+          # 3) Публикуем в окружение
+          {
+            echo "VOICE_URL=${VOICE_URL:-}"
+            echo "JOB_ID=$JOB_ID"
+            echo "MAKE_CALLBACK_URL=$MAKE_CALLBACK_URL"
+          } >> $GITHUB_ENV
+
+          echo ">> Resolved"
+          echo "   VOICE_URL=${VOICE_URL:-<empty>}"
+          echo "   JOB_ID=$JOB_ID"
+          echo "   MAKE_CALLBACK_URL=$(echo "$MAKE_CALLBACK_URL" | sed -E 's#^(https?://[^/]+).*#\1#')"
 
       - name: Debug client_payload (for repo_dispatch)
         run: |
           echo 'client_payload JSON:'
           echo '${{ toJSON(github.event.client_payload) }}'
 
-      # === Диагностика №1: проверяем, что секреты заданы ===
+      # ====== ПРОВЕРКА СЕКРЕТОВ ======
       - name: Check required secrets presence
         env:
           INTRO_URL:         ${{ secrets.INTRO_URL }}
@@ -75,14 +86,15 @@ jobs:
           set -e
           miss=0
           for k in INTRO_URL OUTRO_URL BG_URL CLD_CLOUD_NAME CLD_UPLOAD_PRESET; do
-            v="${!k}"; if [ -z "$v" ]; then
+            v="${!k}"
+            if [ -z "$v" ]; then
               echo "::error title=Missing secret::$k is empty or not configured"; miss=1
             fi
           done
           [ $miss -ne 0 ] && { echo "Some secrets are missing. See errors above."; exit 1; }
           echo "All required secrets are present."
 
-      # === Диагностика №2: санитизируем и валидируем URL-ы ===
+      # ====== ВАЛИДАЦИЯ URL-ОВ ======
       - name: Validate & sanitize URLs
         env:
           INTRO_URL_RAW: ${{ secrets.INTRO_URL }}
@@ -90,32 +102,35 @@ jobs:
           BG_URL_RAW:    ${{ secrets.BG_URL }}
         run: |
           set -e
-          trim() { printf "%s" "$1" | tr -d '\r' | xargs; }
+          trim(){ printf "%s" "$1" | tr -d '\r' | xargs; }
+
           VOICE_URL="$(trim "$VOICE_URL")"
           INTRO_URL="$(trim "$INTRO_URL_RAW")"
           OUTRO_URL="$(trim "$OUTRO_URL_RAW")"
           BG_URL="$(trim "$BG_URL_RAW")"
+          MAKE_CALLBACK_URL="$(trim "$MAKE_CALLBACK_URL")"
+
+          req_url(){ [ -z "$2" ] && { echo "::error title=$1 missing::Set $1"; exit 1; }
+                     echo "$2" | grep -qi '^https\?://' || { echo "::error title=$1 invalid::Must start with http/https"; exit 1; }; }
+
+          req_url "VOICE_URL" "$VOICE_URL"
+          req_url "INTRO_URL" "$INTRO_URL"
+          req_url "OUTRO_URL" "$OUTRO_URL"
+          req_url "BG_URL"    "$BG_URL"
+          req_url "MAKE_CALLBACK_URL" "$MAKE_CALLBACK_URL"
+
           {
             echo "VOICE_URL=$VOICE_URL"
             echo "INTRO_URL=$INTRO_URL"
             echo "OUTRO_URL=$OUTRO_URL"
             echo "BG_URL=$BG_URL"
+            echo "MAKE_CALLBACK_URL=$MAKE_CALLBACK_URL"
           } >> $GITHUB_ENV
 
-          req_url () {   # name, value
-            [ -z "$2" ] && { echo "::error title=$1 missing::Set $1"; exit 1; }
-            echo "$2" | grep -qi '^https\?://' || { echo "::error title=$1 invalid::Must start with http/https"; exit 1; }
-          }
-          req_url "VOICE_URL" "$VOICE_URL"
-          req_url "INTRO_URL" "$INTRO_URL"
-          req_url "OUTRO_URL" "$OUTRO_URL"
-          req_url "BG_URL"    "$BG_URL"
-
-          # Колбэк обязателен
-          req_url "MAKE_CALLBACK_URL" "$MAKE_CALLBACK_URL"
           echo "VOICE_URL host: $(echo "$VOICE_URL" | sed -E 's#^(https?://[^/]+).*#\1#')/…"
-          echo "Callback to: $(echo "$MAKE_CALLBACK_URL" | sed -E 's#^(https?://[^/]+).*#\1#')"
+          echo "Callback host: $(echo "$MAKE_CALLBACK_URL" | sed -E 's#^(https?://[^/]+).*#\1#')"
 
+      # ====== АУДИО-ПАЙПЛАЙН ======
       - name: Download input files
         run: |
           set -e
@@ -185,10 +200,12 @@ jobs:
           echo "FINAL_URL=$URL" >> $GITHUB_ENV
           echo "Uploaded: $URL"
 
+      # ====== КОЛБЭК В MAKE (job_id+final_audio_url+метрики) ======
       - name: Callback to Make
         run: |
           set -e
           echo "Callback -> $MAKE_CALLBACK_URL"
+
           jq -n \
             --arg job_id "$JOB_ID" \
             --arg final_audio_url "$FINAL_URL" \
@@ -196,13 +213,12 @@ jobs:
             --arg duration "$FINAL_DURATION" \
             '{job_id:$job_id, final_audio_url:$final_audio_url, lufs: ($lufs|tonumber), duration: ($duration|tonumber)}' \
           | tee payload.json
-          
+
           echo "::group::POST Make callback"
           http_code=$(curl -w "%{http_code}" --fail --show-error -s -o resp.json \
             -H "Content-Type: application/json" \
             -A "MixerGH/1.0" \
             -X POST -d @payload.json "$MAKE_CALLBACK_URL") || { echo "HTTP failed"; cat resp.json || true; exit 1; }
           echo "HTTP $http_code"
-          echo "Response:"
-          cat resp.json || true
+          echo "Response:"; cat resp.json || true
           echo "::endgroup::"
