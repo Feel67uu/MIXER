@@ -1,15 +1,13 @@
 name: MIXER
+
 on:
-  workflow_dispatch:            # ручной запуск из Actions
+  workflow_dispatch:
     inputs:
       voice_url:
-        description: "Ссылка на mp3 с голосом (Cloudinary secure_url) — для ручного запуска"
+        description: 'URL mp3 файла голоса от ElevenLabs'
         required: true
-        type: string
-  push:
-    branches: [ main ]          # автозапуск при коммите (для тестов)
   repository_dispatch:
-    types: [mix_audio]          # запуск из Make через GitHub API
+    types: [mix_audio]
 
 jobs:
   build:
@@ -21,54 +19,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
-      - name: Read payload (may be empty on manual run)
+      - name: Read payload (voice url comes from Make or manual input)
         run: |
-          echo '${{ toJson(github.event.client_payload) }}' > payload.json
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "{\"voice_url\": \"${{ github.event.inputs.voice_url }}\"}" > payload.json
+          else
+            echo '${{ toJson(github.event.client_payload) }}' > payload.json
+          fi
           cat payload.json
 
-      - name: Resolve VOICE_URL (manual input or dispatch payload)
-        id: resolve
-        run: |
-          VOICE_URL="${{ github.event.inputs.voice_url }}"
-          if [ -z "$VOICE_URL" ] || [ "$VOICE_URL" = "null" ]; then
-            VOICE_URL=$(jq -r '.voice_url // empty' payload.json)
-          fi
-          if [ -z "$VOICE_URL" ]; then
-            echo "❌ VOICE_URL пуст. Передай его в Run workflow ИЛИ из Make через repository_dispatch."
-            exit 1
-          fi
-          echo "VOICE_URL=$VOICE_URL" >> $GITHUB_ENV
-          echo "✔ Using VOICE_URL=$VOICE_URL"
-
-      - name: Download input files (with diagnostics)
+      - name: Download input files
         env:
           INTRO_URL: ${{ secrets.INTRO_URL }}
           OUTRO_URL: ${{ secrets.OUTRO_URL }}
           BG_URL:    ${{ secrets.BG_URL }}
         run: |
-          set -e
-          echo "::group::Check URLs"
-          echo "INTRO_URL=$INTRO_URL"
-          echo "OUTRO_URL=$OUTRO_URL"
-          echo "BG_URL=$BG_URL"
-          for U in "$VOICE_URL" "$INTRO_URL" "$OUTRO_URL" "$BG_URL"; do
-            echo "HEAD $U"
-            curl -I -L --max-redirs 5 "$U" | sed -n '1,5p' || true
-          done
-          echo "::endgroup::"
+          VOICE_URL=$(jq -r '.voice_url' payload.json)
 
-          echo "::group::Download files"
-          curl -fSL "$VOICE_URL" -o voice.mp3
-          curl -fSL "$INTRO_URL" -o intro.mp3
-          curl -fSL "$OUTRO_URL" -o outro.mp3
-          curl -fSL "$BG_URL"    -o bg.mp3
-          ls -lh
-          echo "::endgroup::"
+          curl -L "$VOICE_URL" -o voice.mp3
+          curl -L "$INTRO_URL" -o intro.mp3
+          curl -L "$OUTRO_URL" -o outro.mp3
+          curl -L "$BG_URL"    -o bg.mp3
 
       - name: Mix voice + background (loop bg, adjust volumes)
         env:
-          BG_DB: "-18"      # громкость подложки
-          VOICE_DB: "0"     # усиление/ослабление голоса
+          BG_DB: "-18"     # громкость подложки
+          VOICE_DB: "0"    # громкость голоса
         run: |
           ffmpeg -y -stream_loop -1 -i bg.mp3 -i voice.mp3 \
             -filter_complex "[0:a]volume=${BG_DB}dB[bg];[bg][1:a]amix=inputs=2:duration=shortest:dropout_transition=2[m];[m]volume=${VOICE_DB}dB[out]" \
@@ -81,12 +57,11 @@ jobs:
           ffmpeg -y -i intro.mp3 -i voice_mix.mp3 -i outro.mp3 \
             -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[out]" \
             -map "[out]" -ar 44100 -b:a 128k result.mp3
-          ls -lh result.mp3
 
       - name: Upload to Cloudinary (unsigned preset)
         env:
-          CLD_CLOUD_NAME:   ${{ secrets.CLD_CLOUD_NAME }}
-          CLD_UPLOAD_PRESET:${{ secrets.CLD_UPLOAD_PRESET }}
+          CLD_CLOUD_NAME:    ${{ secrets.CLD_CLOUD_NAME }}
+          CLD_UPLOAD_PRESET: ${{ secrets.CLD_UPLOAD_PRESET }}
         run: |
           set -e
           if [ -z "$CLD_CLOUD_NAME" ] || [ -z "$CLD_UPLOAD_PRESET" ]; then
