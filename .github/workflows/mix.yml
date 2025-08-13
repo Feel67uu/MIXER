@@ -55,6 +55,14 @@ jobs:
           ffmpeg -y -i bg.mp3    -ac 2 -ar 44100 bg_fix.wav
           ls -lh *_fix.wav
 
+      # === ПРИГЛУШЕНИЕ ИНТРО И АУТРО ===
+      - name: Lower intro and outro volumes
+        run: |
+          ffmpeg -y -i intro_fix.wav -filter:a "volume=-6dB" intro_quiet.wav
+          ffmpeg -y -i outro_fix.wav -filter:a "volume=-6dB" outro_quiet.wav
+          mv intro_quiet.wav intro_fix.wav
+          mv outro_quiet.wav outro_fix.wav
+
       # === ФОН ПОД ДЛИНУ ГОЛОСА ===
       - name: Loop & trim background to voice duration
         env:
@@ -68,13 +76,13 @@ jobs:
       # === СМЕШИВАНИЕ ГОЛОС + ФОН ===
       - name: Mix voice + bg (duration=voice)
         env:
-          VOICE_DB: "0"       # усиление/ослабление голоса
+          VOICE_DB: "0"
         run: |
           ffmpeg -y -i voice_fix.wav -i bg_cut.wav \
             -filter_complex "[0:a]volume=${VOICE_DB}dB[a0];[a0][1:a]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
             -map "[aout]" -ar 44100 voice_mix.wav
 
-      # === КОНКАТЕНАЦИЯ ИНТРО + МИКС + АУТРО ===
+      # === КОНКАТЕНАЦИЯ ===
       - name: Concat intro + mixed + outro
         run: |
           ffmpeg -y -i intro_fix.wav -i voice_mix.wav -i outro_fix.wav \
@@ -82,10 +90,9 @@ jobs:
             -map "[a]" -ar 44100 -b:a 160k result.mp3
           ls -lh result.mp3
 
-      # === ВЫРАВНИВАНИЕ ГРОМКОСТИ ВСЕГО ТРЕКА ДО -16 LUFS ===
+      # === ВЫРАВНИВАНИЕ ГРОМКОСТИ ДО -16 LUFS ===
       - name: Loudness normalize to -16 LUFS
         run: |
-          # Однопроходная нормализация для простоты (подкаст-стандарт)
           ffmpeg -y -i result.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k result_norm.mp3
           mv result_norm.mp3 result.mp3
 
@@ -96,10 +103,6 @@ jobs:
           CLD_UPLOAD_PRESET: ${{ secrets.CLD_UPLOAD_PRESET }}
         run: |
           set -e
-          if [ -z "$CLD_CLOUD_NAME" ] || [ -z "$CLD_UPLOAD_PRESET" ]; then
-            echo "❌ Missing CLD_CLOUD_NAME or CLD_UPLOAD_PRESET secrets"; exit 1
-          fi
-          echo "✔ Uploading with preset '$CLD_UPLOAD_PRESET' to cloud '$CLD_CLOUD_NAME'"
           curl -sS -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
             -F file=@result.mp3 \
             -F upload_preset=$CLD_UPLOAD_PRESET \
@@ -108,10 +111,9 @@ jobs:
           cat cld.json
           URL=$(jq -r '.secure_url // empty' cld.json)
           if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-            echo "❌ Cloudinary unsigned upload failed"; exit 1
+            echo "❌ Upload failed"; exit 1
           fi
           echo "FINAL_URL=$URL" >> $GITHUB_ENV
-          echo "✅ Uploaded: $URL"
 
       - name: Callback to Make
         env:
