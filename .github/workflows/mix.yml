@@ -1,9 +1,14 @@
 name: MIXER
 
 on:
-  workflow_dispatch:            # запуск вручную из вкладки Actions
+  workflow_dispatch:            # запуск вручную из Actions
+    inputs:
+      voice_url:
+        description: "URL mp3 с голосом (из Cloudinary), если запускаешь вручную"
+        required: true
+        type: string
   push:
-    branches: [ main ]          # запуск при любом коммите в main
+    branches: [ main ]          # запуск от любого коммита (для тестов)
   repository_dispatch:
     types: [mix_audio]          # запуск из Make через GitHub API
 
@@ -17,10 +22,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
-      - name: Read payload (voice url comes from Make)
+      - name: Read payload (may be empty on manual run)
         run: |
           echo '${{ toJson(github.event.client_payload) }}' > payload.json
           cat payload.json
+
+      - name: Resolve VOICE_URL (manual input or dispatch payload)
+        id: resolve
+        run: |
+          VOICE_URL="${{ github.event.inputs.voice_url }}"
+          if [ -z "$VOICE_URL" ] || [ "$VOICE_URL" = "null" ]; then
+            VOICE_URL=$(jq -r '.voice_url // empty' payload.json)
+          fi
+          if [ -z "$VOICE_URL" ]; then
+            echo "❌ VOICE_URL пуст. Передай его в Run workflow ИЛИ из Make через repository_dispatch."
+            exit 1
+          fi
+          echo "VOICE_URL=$VOICE_URL" >> $GITHUB_ENV
 
       - name: Download input files
         env:
@@ -28,11 +46,11 @@ jobs:
           OUTRO_URL: ${{ secrets.OUTRO_URL }}
           BG_URL:    ${{ secrets.BG_URL }}
         run: |
-          VOICE_URL=$(jq -r '.voice_url' payload.json)
-          curl -L "$VOICE_URL" -o voice.mp3
-          curl -L "$INTRO_URL" -o intro.mp3
-          curl -L "$OUTRO_URL" -o outro.mp3
-          curl -L "$BG_URL"    -o bg.mp3
+          set -e
+          curl -fSL "$VOICE_URL" -o voice.mp3
+          curl -fSL "$INTRO_URL" -o intro.mp3
+          curl -fSL "$OUTRO_URL" -o outro.mp3
+          curl -fSL "$BG_URL"    -o bg.mp3
 
       - name: Mix voice + background (loop bg, adjust volumes)
         env:
@@ -65,11 +83,14 @@ jobs:
             -F overwrite=true > cld.json
           cat cld.json
           URL=$(jq -r '.secure_url' cld.json)
+          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "❌ Cloudinary upload failed"; exit 1
+          fi
           echo "FINAL_URL=$URL" >> $GITHUB_ENV
 
       - name: Callback to Make
         env:
           MAKE_CALLBACK_URL: ${{ secrets.MAKE_CALLBACK_URL }}
         run: |
-          curl -X POST -H "Content-Type: application/json" \
+          curl -fSL -X POST -H "Content-Type: application/json" \
             -d "{\"final_url\":\"$FINAL_URL\"}" "$MAKE_CALLBACK_URL"
