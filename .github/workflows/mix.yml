@@ -12,6 +12,10 @@ on:
   repository_dispatch:
     types: [mix, mix_audio]
 
+concurrency:
+  group: mixer
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,21 +36,16 @@ jobs:
           set -e
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # Ручной запуск
-            if [ -n "${{ github.event.inputs.voice_url }}" ]; then
-              echo "VOICE_URL=${{ github.event.inputs.voice_url }}" >> $GITHUB_ENV
-            fi
+            [ -n "${{ github.event.inputs.voice_url }}" ] && echo "VOICE_URL=${{ github.event.inputs.voice_url }}" >> $GITHUB_ENV
             if [ -n "${{ github.event.inputs.job_id }}" ]; then
               echo "JOB_ID=${{ github.event.inputs.job_id }}" >> $GITHUB_ENV
             else
               echo "JOB_ID=$(date +%s)-$RANDOM" >> $GITHUB_ENV
             fi
-            # Колбэк берём из секрета
             echo "MAKE_CALLBACK_URL=$SECRET_CALLBACK" >> $GITHUB_ENV
           else
             # repository_dispatch
-            if [ -n "${{ github.event.client_payload.voice_url }}" ]; then
-              echo "VOICE_URL=${{ github.event.client_payload.voice_url }}" >> $GITHUB_ENV
-            fi
+            [ -n "${{ github.event.client_payload.voice_url }}" ] && echo "VOICE_URL=${{ github.event.client_payload.voice_url }}" >> $GITHUB_ENV
             if [ -n "${{ github.event.client_payload.job_id }}" ]; then
               echo "JOB_ID=${{ github.event.client_payload.job_id }}" >> $GITHUB_ENV
             else
@@ -76,15 +75,11 @@ jobs:
           set -e
           miss=0
           for k in INTRO_URL OUTRO_URL BG_URL CLD_CLOUD_NAME CLD_UPLOAD_PRESET; do
-            v="${!k}"
-            if [ -z "$v" ]; then
-              echo "::error title=Missing secret::$k is empty or not configured"
-              miss=1
+            v="${!k}"; if [ -z "$v" ]; then
+              echo "::error title=Missing secret::$k is empty or not configured"; miss=1
             fi
           done
-          if [ $miss -ne 0 ]; then
-            echo "Some secrets are missing. See errors above."; exit 1
-          fi
+          [ $miss -ne 0 ] && { echo "Some secrets are missing. See errors above."; exit 1; }
           echo "All required secrets are present."
 
       # === Диагностика №2: санитизируем и валидируем URL-ы ===
@@ -95,13 +90,11 @@ jobs:
           BG_URL_RAW:    ${{ secrets.BG_URL }}
         run: |
           set -e
-          # убираем скрытые \r и пробелы по краям
-          VOICE_URL=$(printf "%s" "$VOICE_URL" | tr -d '\r' | xargs)
-          INTRO_URL=$(printf "%s" "$INTRO_URL_RAW" | tr -d '\r' | xargs)
-          OUTRO_URL=$(printf "%s" "$OUTRO_URL_RAW" | tr -d '\r' | xargs)
-          BG_URL=$(printf "%s" "$BG_URL_RAW"       | tr -d '\r' | xargs)
-
-          # публикуем обратно в env
+          trim() { printf "%s" "$1" | tr -d '\r' | xargs; }
+          VOICE_URL="$(trim "$VOICE_URL")"
+          INTRO_URL="$(trim "$INTRO_URL_RAW")"
+          OUTRO_URL="$(trim "$OUTRO_URL_RAW")"
+          BG_URL="$(trim "$BG_URL_RAW")"
           {
             echo "VOICE_URL=$VOICE_URL"
             echo "INTRO_URL=$INTRO_URL"
@@ -109,29 +102,19 @@ jobs:
             echo "BG_URL=$BG_URL"
           } >> $GITHUB_ENV
 
-          # Проверка VOICE_URL отдельно (самая частая причина падений)
-          if [ -z "$VOICE_URL" ]; then
-            echo "::error title=Set VOICE_URL (missing URL)::You must pass voice_url in repository_dispatch.client_payload or workflow input"
-            exit 1
-          fi
-
-          check_url () {
-            local name="$1"; local val="$2"
-            if [ -z "$val" ]; then
-              echo "::error title=$name is empty::Set $name (missing URL)"; exit 1
-            fi
-            if ! echo "$val" | grep -qi '^https\?://'; then
-              echo "::error title=$name invalid::URL must start with http/https, got: $val"; exit 1
-            fi
+          req_url () {   # name, value
+            [ -z "$2" ] && { echo "::error title=$1 missing::Set $1"; exit 1; }
+            echo "$2" | grep -qi '^https\?://' || { echo "::error title=$1 invalid::Must start with http/https"; exit 1; }
           }
+          req_url "VOICE_URL" "$VOICE_URL"
+          req_url "INTRO_URL" "$INTRO_URL"
+          req_url "OUTRO_URL" "$OUTRO_URL"
+          req_url "BG_URL"    "$BG_URL"
 
-          check_url "VOICE_URL" "$VOICE_URL"
-          check_url "INTRO_URL" "$INTRO_URL"
-          check_url "OUTRO_URL" "$OUTRO_URL"
-          check_url "BG_URL"    "$BG_URL"
-
+          # Колбэк обязателен
+          req_url "MAKE_CALLBACK_URL" "$MAKE_CALLBACK_URL"
           echo "VOICE_URL host: $(echo "$VOICE_URL" | sed -E 's#^(https?://[^/]+).*#\1#')/…"
-          echo "Intro/Outro/BG: set ✅"
+          echo "Callback to: $(echo "$MAKE_CALLBACK_URL" | sed -E 's#^(https?://[^/]+).*#\1#')"
 
       - name: Download input files
         run: |
@@ -198,6 +181,7 @@ jobs:
             -F file=@result.mp3 \
             -F upload_preset=$CLD_UPLOAD_PRESET \
             -F folder=prokis | jq -r '.secure_url')
+          [ -z "$URL" -o "$URL" = "null" ] && { echo "::error title=Cloudinary::Upload failed"; exit 1; }
           echo "FINAL_URL=$URL" >> $GITHUB_ENV
           echo "Uploaded: $URL"
 
@@ -210,8 +194,15 @@ jobs:
             --arg final_audio_url "$FINAL_URL" \
             --arg lufs "-16" \
             --arg duration "$FINAL_DURATION" \
-            '{job_id:$job_id, final_audio_url:$final_audio_url, lufs:$lufs, duration: ($duration|tonumber)}' \
+            '{job_id:$job_id, final_audio_url:$final_audio_url, lufs: ($lufs|tonumber), duration: ($duration|tonumber)}' \
           | tee payload.json
-
-          curl -s -X POST -H "Content-Type: application/json" \
-            -d @payload.json "$MAKE_CALLBACK_URL"
+          
+          echo "::group::POST Make callback"
+          http_code=$(curl -w "%{http_code}" --fail --show-error -s -o resp.json \
+            -H "Content-Type: application/json" \
+            -A "MixerGH/1.0" \
+            -X POST -d @payload.json "$MAKE_CALLBACK_URL") || { echo "HTTP failed"; cat resp.json || true; exit 1; }
+          echo "HTTP $http_code"
+          echo "Response:"
+          cat resp.json || true
+          echo "::endgroup::"
