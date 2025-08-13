@@ -1,14 +1,14 @@
 name: MIXER
 
 on:
-  workflow_dispatch:            # запуск вручную из Actions
+  workflow_dispatch:            # ручной запуск из Actions
     inputs:
       voice_url:
-        description: "URL mp3 с голосом (из Cloudinary), если запускаешь вручную"
+        description: "Ссылка на mp3 с голосом (Cloudinary secure_url) — для ручного запуска"
         required: true
         type: string
   push:
-    branches: [ main ]          # запуск от любого коммита (для тестов)
+    branches: [ main ]          # автозапуск при коммите (для тестов)
   repository_dispatch:
     types: [mix_audio]          # запуск из Make через GitHub API
 
@@ -39,18 +39,32 @@ jobs:
             exit 1
           fi
           echo "VOICE_URL=$VOICE_URL" >> $GITHUB_ENV
+          echo "✔ Using VOICE_URL=$VOICE_URL"
 
-      - name: Download input files
+      - name: Download input files (with diagnostics)
         env:
           INTRO_URL: ${{ secrets.INTRO_URL }}
           OUTRO_URL: ${{ secrets.OUTRO_URL }}
           BG_URL:    ${{ secrets.BG_URL }}
         run: |
           set -e
+          echo "::group::Check URLs"
+          echo "INTRO_URL=$INTRO_URL"
+          echo "OUTRO_URL=$OUTRO_URL"
+          echo "BG_URL=$BG_URL"
+          for U in "$VOICE_URL" "$INTRO_URL" "$OUTRO_URL" "$BG_URL"; do
+            echo "HEAD $U"
+            curl -I -L --max-redirs 5 "$U" | sed -n '1,5p' || true
+          done
+          echo "::endgroup::"
+
+          echo "::group::Download files"
           curl -fSL "$VOICE_URL" -o voice.mp3
           curl -fSL "$INTRO_URL" -o intro.mp3
           curl -fSL "$OUTRO_URL" -o outro.mp3
           curl -fSL "$BG_URL"    -o bg.mp3
+          ls -lh
+          echo "::endgroup::"
 
       - name: Mix voice + background (loop bg, adjust volumes)
         env:
@@ -68,25 +82,31 @@ jobs:
           ffmpeg -y -i intro.mp3 -i voice_mix.mp3 -i outro.mp3 \
             -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[out]" \
             -map "[out]" -ar 44100 -b:a 128k result.mp3
+          ls -lh result.mp3
 
-      - name: Upload to Cloudinary
+      - name: Upload to Cloudinary (unsigned preset)
         env:
-          CLD_CLOUD_NAME: ${{ secrets.CLD_CLOUD_NAME }}
-          CLD_API_KEY:    ${{ secrets.CLD_API_KEY }}
-          CLD_API_SECRET: ${{ secrets.CLD_API_SECRET }}
+          CLD_CLOUD_NAME:   ${{ secrets.CLD_CLOUD_NAME }}
+          CLD_UPLOAD_PRESET:${{ secrets.CLD_UPLOAD_PRESET }}
         run: |
-          TS=$(date +%s)
-          curl -u "$CLD_API_KEY:$CLD_API_SECRET" \
-            -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
+          set -e
+          if [ -z "$CLD_CLOUD_NAME" ] || [ -z "$CLD_UPLOAD_PRESET" ]; then
+            echo "❌ Missing CLD_CLOUD_NAME or CLD_UPLOAD_PRESET secrets"; exit 1
+          fi
+          echo "✔ Uploading with unsigned preset '$CLD_UPLOAD_PRESET' to cloud '$CLD_CLOUD_NAME'"
+          curl -sS -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
             -F file=@result.mp3 \
-            -F public_id="prokis/mix_$TS" \
-            -F overwrite=true > cld.json
+            -F upload_preset=$CLD_UPLOAD_PRESET \
+            -F folder=prokis \
+            -w "\nHTTP %{http_code}\n" \
+            -o cld.json
           cat cld.json
-          URL=$(jq -r '.secure_url' cld.json)
+          URL=$(jq -r '.secure_url // empty' cld.json)
           if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-            echo "❌ Cloudinary upload failed"; exit 1
+            echo "❌ Cloudinary unsigned upload failed"; exit 1
           fi
           echo "FINAL_URL=$URL" >> $GITHUB_ENV
+          echo "✅ Uploaded: $URL"
 
       - name: Callback to Make
         env:
