@@ -57,7 +57,7 @@ jobs:
           ffmpeg -y -i bg.mp3     -ar 44100 -ac 2 bg_fix.wav
           ffmpeg -y -i voice.mp3  -ar 44100 -ac 2 voice_fix.wav
 
-      # Интро/аутро тише + мягкие фейды
+      # Интро/аутро тише + мягкие фейды (универсальный способ: симметричные fade in/out)
       - name: Lower intro and outro volumes (+fades)
         run: |
           ffmpeg -y -i intro_fix.wav -af "volume=-6dB,afade=t=in:d=0.4,areverse,afade=t=in:d=0.4,areverse" intro_fx.wav
@@ -67,24 +67,22 @@ jobs:
 
       # Делаем фон длиной ровно с голос
       - name: Loop & trim background to voice duration
-        env:
-          BG_TRIM_PAD: "0"
         run: |
           set -e
           VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice_fix.wav)
           ffmpeg -y -stream_loop -1 -i bg_fix.wav -t "$VDUR" bg_loop.wav
 
-      # Микс с автодакингом (ПРАВИЛЬНЫЙ фильтр: sidechaincompress)
+      # Микс с автодакингом (sidechaincompress) — ИСПРАВЛЕНО: makeup=4 (диапазон 1..64)
       - name: Mix voice + bg (sidechain ducking)
         env:
-          VOICE_DB: "1.5"   # усиление голоса
+          VOICE_DB: "1.5"   # подними/опусти голос при необходимости
           BG_DB:   "-10"    # базовый уровень фона до дакинга
         run: |
           ffmpeg -y -i voice_fix.wav -i bg_loop.wav \
             -filter_complex "\
               [1:a]volume=${BG_DB}dB,highpass=f=120,lowpass=f=8000[bg]; \
               [0:a]volume=${VOICE_DB}dB[voice]; \
-              [bg][voice]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=250:makeup=0[bgduck]; \
+              [bg][voice]sidechaincompress=threshold=0.1:ratio=8:attack=5:release=250:makeup=4:detection=peak[bgduck]; \
               [voice][bgduck]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
             -map "[aout]" -ar 44100 -ac 2 voice_mix.wav
 
