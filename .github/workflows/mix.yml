@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       voice_url:
-        description: 'URL mp3 файла голоса от ElevenLabs'
+        description: 'URL mp3 голоса (Cloudinary secure_url)'
         required: true
   repository_dispatch:
     types: [mix_audio]
@@ -19,7 +19,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
-      - name: Read payload (voice url comes from Make or manual input)
+      - name: Read payload (manual or dispatch)
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "{\"voice_url\": \"${{ github.event.inputs.voice_url }}\"}" > payload.json
@@ -34,30 +34,58 @@ jobs:
           OUTRO_URL: ${{ secrets.OUTRO_URL }}
           BG_URL:    ${{ secrets.BG_URL }}
         run: |
+          set -e
           VOICE_URL=$(jq -r '.voice_url' payload.json)
+          echo "VOICE_URL=$VOICE_URL"
+          for U in "$VOICE_URL" "$INTRO_URL" "$OUTRO_URL" "$BG_URL"; do
+            echo "HEAD $U" && curl -I -L --max-redirs 5 "$U" | sed -n '1,5p' || true
+          done
+          curl -fSL "$VOICE_URL" -o voice.mp3
+          curl -fSL "$INTRO_URL" -o intro.mp3
+          curl -fSL "$OUTRO_URL" -o outro.mp3
+          curl -fSL "$BG_URL"    -o bg.mp3
+          ls -lh
 
-          curl -L "$VOICE_URL" -o voice.mp3
-          curl -L "$INTRO_URL" -o intro.mp3
-          curl -L "$OUTRO_URL" -o outro.mp3
-          curl -L "$BG_URL"    -o bg.mp3
+      # === НОРМАЛИЗАЦИЯ АУДИО ===
+      - name: Normalize all to 44.1kHz stereo (WAV)
+        run: |
+          ffmpeg -y -i intro.mp3 -ac 2 -ar 44100 intro_fix.wav
+          ffmpeg -y -i voice.mp3 -ac 2 -ar 44100 voice_fix.wav
+          ffmpeg -y -i outro.mp3 -ac 2 -ar 44100 outro_fix.wav
+          ffmpeg -y -i bg.mp3    -ac 2 -ar 44100 bg_fix.wav
+          ls -lh *_fix.wav
 
-      - name: Mix voice + background (loop bg, adjust volumes)
+      # === ПОЛУЧАЕМ ДЛИНУ ГОЛОСА И РЕЖЕМ ФОН РОВНО ПОД НЕГО ===
+      - name: Loop & trim background to voice duration
         env:
-          BG_DB: "-18"     # громкость подложки
-          VOICE_DB: "0"    # громкость голоса
+          BG_DB: "-18"        # громкость подложки
         run: |
-          ffmpeg -y -stream_loop -1 -i bg.mp3 -i voice.mp3 \
-            -filter_complex "[0:a]volume=${BG_DB}dB[bg];[bg][1:a]amix=inputs=2:duration=shortest:dropout_transition=2[m];[m]volume=${VOICE_DB}dB[out]" \
-            -map "[out]" -shortest -ar 44100 -b:a 128k voice_mix.mp3
+          set -e
+          VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice_fix.wav)
+          echo "Voice duration: $VDUR s"
+          # Зацикливаем фон и режем ровно под длину голоса
+          ffmpeg -y -stream_loop -1 -i bg_fix.wav -t "$VDUR" -af "volume=${BG_DB}dB" bg_loop.wav
+          ffmpeg -y -i bg_loop.wav -t "$VDUR" -c copy bg_cut.wav
 
-      - name: Concatenate intro + mix + outro
+      # === СМЕШИВАНИЕ ГОЛОС + ФОН (длина = длине голоса) ===
+      - name: Mix voice + bg (duration=voice)
+        env:
+          VOICE_DB: "0"       # усиление/ослабление голоса
         run: |
-          printf "file 'intro.mp3'\nfile 'voice_mix.mp3'\nfile 'outro.mp3'\n" > list.txt
-          ffmpeg -y -f concat -safe 0 -i list.txt -c copy result.mp3 || \
-          ffmpeg -y -i intro.mp3 -i voice_mix.mp3 -i outro.mp3 \
-            -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[out]" \
-            -map "[out]" -ar 44100 -b:a 128k result.mp3
+          # [0]=голос, [1]=фон, длина = длительности первого (голоса)
+          ffmpeg -y -i voice_fix.wav -i bg_cut.wav \
+            -filter_complex "[0:a]volume=${VOICE_DB}dB[a0];[a0][1:a]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
+            -map "[aout]" -ar 44100 voice_mix.wav
 
+      # === КОНКАТЕНАЦИЯ ЧЕРЕЗ ФИЛЬТР (нигде не копируем потоки) ===
+      - name: Concat intro + mixed + outro
+        run: |
+          ffmpeg -y -i intro_fix.wav -i voice_mix.wav -i outro_fix.wav \
+            -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
+            -map "[a]" -ar 44100 -b:a 160k result.mp3
+          ls -lh result.mp3
+
+      # === ЗАГРУЗКА В CLOUDINARY (UNSIGNED PRESET) ===
       - name: Upload to Cloudinary (unsigned preset)
         env:
           CLD_CLOUD_NAME:    ${{ secrets.CLD_CLOUD_NAME }}
@@ -67,12 +95,11 @@ jobs:
           if [ -z "$CLD_CLOUD_NAME" ] || [ -z "$CLD_UPLOAD_PRESET" ]; then
             echo "❌ Missing CLD_CLOUD_NAME or CLD_UPLOAD_PRESET secrets"; exit 1
           fi
-          echo "✔ Uploading with unsigned preset '$CLD_UPLOAD_PRESET' to cloud '$CLD_CLOUD_NAME'"
+          echo "✔ Uploading with preset '$CLD_UPLOAD_PRESET' to cloud '$CLD_CLOUD_NAME'"
           curl -sS -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
             -F file=@result.mp3 \
             -F upload_preset=$CLD_UPLOAD_PRESET \
             -F folder=prokis \
-            -w "\nHTTP %{http_code}\n" \
             -o cld.json
           cat cld.json
           URL=$(jq -r '.secure_url // empty' cld.json)
