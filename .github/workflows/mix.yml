@@ -27,42 +27,99 @@ jobs:
           SECRET_CALLBACK: ${{ secrets.MAKE_CALLBACK_URL }}
         run: |
           set -e
-
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # Ручной запуск
             echo "VOICE_URL=${{ github.event.inputs.voice_url }}" >> $GITHUB_ENV
-
             if [ -n "${{ github.event.inputs.job_id }}" ]; then
               echo "JOB_ID=${{ github.event.inputs.job_id }}" >> $GITHUB_ENV
             else
               echo "JOB_ID=$(date +%s)-$RANDOM" >> $GITHUB_ENV
             fi
-
-            # Для ручного запуска колбэк берём из секрета
+            # Колбэк берём из секрета
             echo "MAKE_CALLBACK_URL=$SECRET_CALLBACK" >> $GITHUB_ENV
           else
             # repository_dispatch
             echo "VOICE_URL=${{ github.event.client_payload.voice_url }}" >> $GITHUB_ENV
-            echo "JOB_ID=${{ github.event.client_payload.job_id }}" >> $GITHUB_ENV
-
-            # Сначала пробуем взять URL из payload; если пусто — из секрета
+            if [ -n "${{ github.event.client_payload.job_id }}" ]; then
+              echo "JOB_ID=${{ github.event.client_payload.job_id }}" >> $GITHUB_ENV
+            else
+              echo "JOB_ID=$(date +%s)-$RANDOM" >> $GITHUB_ENV
+            fi
             if [ -n "${{ github.event.client_payload.make_callback_url }}" ]; then
               echo "MAKE_CALLBACK_URL=${{ github.event.client_payload.make_callback_url }}" >> $GITHUB_ENV
             else
               echo "MAKE_CALLBACK_URL=$SECRET_CALLBACK" >> $GITHUB_ENV
             fi
           fi
-
           echo "Resolved:"
           echo "  VOICE_URL=$VOICE_URL"
           echo "  JOB_ID=$JOB_ID"
           echo "  MAKE_CALLBACK_URL=$MAKE_CALLBACK_URL"
 
-      - name: Download input files
+      # === Диагностика №1: проверяем, что секреты заданы ===
+      - name: Check required secrets presence
         env:
-          INTRO_URL: ${{ secrets.INTRO_URL }}
-          OUTRO_URL: ${{ secrets.OUTRO_URL }}
-          BG_URL:    ${{ secrets.BG_URL }}
+          INTRO_URL:         ${{ secrets.INTRO_URL }}
+          OUTRO_URL:         ${{ secrets.OUTRO_URL }}
+          BG_URL:            ${{ secrets.BG_URL }}
+          CLD_CLOUD_NAME:    ${{ secrets.CLD_CLOUD_NAME }}
+          CLD_UPLOAD_PRESET: ${{ secrets.CLD_UPLOAD_PRESET }}
+        run: |
+          set -e
+          miss=0
+          for k in INTRO_URL OUTRO_URL BG_URL CLD_CLOUD_NAME CLD_UPLOAD_PRESET; do
+            v="${!k}"
+            if [ -z "$v" ]; then
+              echo "::error title=Missing secret::$k is empty or not configured"
+              miss=1
+            fi
+          done
+          if [ $miss -ne 0 ]; then
+            echo "Some secrets are missing. See errors above."; exit 1
+          fi
+          echo "All required secrets are present."
+
+      # === Диагностика №2: санитизируем и валидируем URL-ы ===
+      - name: Validate & sanitize URLs
+        env:
+          INTRO_URL_RAW: ${{ secrets.INTRO_URL }}
+          OUTRO_URL_RAW: ${{ secrets.OUTRO_URL }}
+          BG_URL_RAW:    ${{ secrets.BG_URL }}
+        run: |
+          set -e
+          # убираем скрытые \r и пробелы по краям
+          VOICE_URL=$(printf "%s" "$VOICE_URL" | tr -d '\r' | xargs)
+          INTRO_URL=$(printf "%s" "$INTRO_URL_RAW" | tr -d '\r' | xargs)
+          OUTRO_URL=$(printf "%s" "$OUTRO_URL_RAW" | tr -d '\r' | xargs)
+          BG_URL=$(printf "%s" "$BG_URL_RAW"       | tr -d '\r' | xargs)
+
+          # публикуем обратно в env
+          {
+            echo "VOICE_URL=$VOICE_URL"
+            echo "INTRO_URL=$INTRO_URL"
+            echo "OUTRO_URL=$OUTRO_URL"
+            echo "BG_URL=$BG_URL"
+          } >> $GITHUB_ENV
+
+          check_url () {
+            local name="$1"; local val="$2"
+            if [ -z "$val" ]; then
+              echo "::error title=$name is empty::Set $name (missing URL)"; exit 1
+            fi
+            if ! echo "$val" | grep -qi '^https\?://'; then
+              echo "::error title=$name invalid::URL must start with http/https, got: $val"; exit 1
+            fi
+          }
+
+          check_url "VOICE_URL" "$VOICE_URL"
+          check_url "INTRO_URL" "$INTRO_URL"
+          check_url "OUTRO_URL" "$OUTRO_URL"
+          check_url "BG_URL"    "$BG_URL"
+
+          echo "VOICE_URL host: $(echo "$VOICE_URL" | sed -E 's#^(https?://[^/]+).*#\1#')/…"
+          echo "Intro/Outro/BG: set ✅"
+
+      - name: Download input files
         run: |
           set -e
           curl -fSL "$VOICE_URL" -o voice.mp3
