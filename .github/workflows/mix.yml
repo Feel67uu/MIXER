@@ -5,7 +5,7 @@ on:
     inputs:
       voice_url:
         description: 'URL mp3/wav с голосом (Cloudinary secure_url)'
-        required: true
+        required: false
       job_id:
         description: 'Опционально: ID партии (для ручного запуска)'
         required: false
@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Install ffmpeg & jq
         run: |
           sudo apt-get update
@@ -29,7 +32,9 @@ jobs:
           set -e
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # Ручной запуск
-            echo "VOICE_URL=${{ github.event.inputs.voice_url }}" >> $GITHUB_ENV
+            if [ -n "${{ github.event.inputs.voice_url }}" ]; then
+              echo "VOICE_URL=${{ github.event.inputs.voice_url }}" >> $GITHUB_ENV
+            fi
             if [ -n "${{ github.event.inputs.job_id }}" ]; then
               echo "JOB_ID=${{ github.event.inputs.job_id }}" >> $GITHUB_ENV
             else
@@ -39,7 +44,9 @@ jobs:
             echo "MAKE_CALLBACK_URL=$SECRET_CALLBACK" >> $GITHUB_ENV
           else
             # repository_dispatch
-            echo "VOICE_URL=${{ github.event.client_payload.voice_url }}" >> $GITHUB_ENV
+            if [ -n "${{ github.event.client_payload.voice_url }}" ]; then
+              echo "VOICE_URL=${{ github.event.client_payload.voice_url }}" >> $GITHUB_ENV
+            fi
             if [ -n "${{ github.event.client_payload.job_id }}" ]; then
               echo "JOB_ID=${{ github.event.client_payload.job_id }}" >> $GITHUB_ENV
             else
@@ -51,10 +58,11 @@ jobs:
               echo "MAKE_CALLBACK_URL=$SECRET_CALLBACK" >> $GITHUB_ENV
             fi
           fi
-          echo "Resolved:"
-          echo "  VOICE_URL=$VOICE_URL"
-          echo "  JOB_ID=$JOB_ID"
-          echo "  MAKE_CALLBACK_URL=$MAKE_CALLBACK_URL"
+
+      - name: Debug client_payload (for repo_dispatch)
+        run: |
+          echo 'client_payload JSON:'
+          echo '${{ toJSON(github.event.client_payload) }}'
 
       # === Диагностика №1: проверяем, что секреты заданы ===
       - name: Check required secrets presence
@@ -100,6 +108,12 @@ jobs:
             echo "OUTRO_URL=$OUTRO_URL"
             echo "BG_URL=$BG_URL"
           } >> $GITHUB_ENV
+
+          # Проверка VOICE_URL отдельно (самая частая причина падений)
+          if [ -z "$VOICE_URL" ]; then
+            echo "::error title=Set VOICE_URL (missing URL)::You must pass voice_url in repository_dispatch.client_payload or workflow input"
+            exit 1
+          fi
 
           check_url () {
             local name="$1"; local val="$2"
