@@ -46,7 +46,7 @@ jobs:
           curl -fSL "$BG_URL"    -o bg.mp3
           ls -lh
 
-      # === НОРМАЛИЗАЦИЯ АУДИО ===
+      # === НОРМАЛИЗАЦИЯ И ПРИВЕДЕНИЕ К ЕДИНОМУ ФОРМАТУ ===
       - name: Normalize all to 44.1kHz stereo (WAV)
         run: |
           ffmpeg -y -i intro.mp3 -ac 2 -ar 44100 intro_fix.wav
@@ -55,7 +55,7 @@ jobs:
           ffmpeg -y -i bg.mp3    -ac 2 -ar 44100 bg_fix.wav
           ls -lh *_fix.wav
 
-      # === ПОЛУЧАЕМ ДЛИНУ ГОЛОСА И РЕЖЕМ ФОН РОВНО ПОД НЕГО ===
+      # === ФОН ПОД ДЛИНУ ГОЛОСА ===
       - name: Loop & trim background to voice duration
         env:
           BG_DB: "-18"        # громкость подложки
@@ -63,27 +63,31 @@ jobs:
           set -e
           VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice_fix.wav)
           echo "Voice duration: $VDUR s"
-          # Зацикливаем фон и режем ровно под длину голоса
-          ffmpeg -y -stream_loop -1 -i bg_fix.wav -t "$VDUR" -af "volume=${BG_DB}dB" bg_loop.wav
-          ffmpeg -y -i bg_loop.wav -t "$VDUR" -c copy bg_cut.wav
+          ffmpeg -y -stream_loop -1 -i bg_fix.wav -t "$VDUR" -af "volume=${BG_DB}dB" bg_cut.wav
 
-      # === СМЕШИВАНИЕ ГОЛОС + ФОН (длина = длине голоса) ===
+      # === СМЕШИВАНИЕ ГОЛОС + ФОН ===
       - name: Mix voice + bg (duration=voice)
         env:
           VOICE_DB: "0"       # усиление/ослабление голоса
         run: |
-          # [0]=голос, [1]=фон, длина = длительности первого (голоса)
           ffmpeg -y -i voice_fix.wav -i bg_cut.wav \
             -filter_complex "[0:a]volume=${VOICE_DB}dB[a0];[a0][1:a]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
             -map "[aout]" -ar 44100 voice_mix.wav
 
-      # === КОНКАТЕНАЦИЯ ЧЕРЕЗ ФИЛЬТР (нигде не копируем потоки) ===
+      # === КОНКАТЕНАЦИЯ ИНТРО + МИКС + АУТРО ===
       - name: Concat intro + mixed + outro
         run: |
           ffmpeg -y -i intro_fix.wav -i voice_mix.wav -i outro_fix.wav \
             -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
             -map "[a]" -ar 44100 -b:a 160k result.mp3
           ls -lh result.mp3
+
+      # === ВЫРАВНИВАНИЕ ГРОМКОСТИ ВСЕГО ТРЕКА ДО -16 LUFS ===
+      - name: Loudness normalize to -16 LUFS
+        run: |
+          # Однопроходная нормализация для простоты (подкаст-стандарт)
+          ffmpeg -y -i result.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k result_norm.mp3
+          mv result_norm.mp3 result.mp3
 
       # === ЗАГРУЗКА В CLOUDINARY (UNSIGNED PRESET) ===
       - name: Upload to Cloudinary (unsigned preset)
