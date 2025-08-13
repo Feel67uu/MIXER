@@ -37,44 +37,32 @@ jobs:
           set -e
           VOICE_URL=$(jq -r '.voice_url' payload.json)
           echo "VOICE_URL=$VOICE_URL"
-          for U in "$VOICE_URL" "$INTRO_URL" "$OUTRO_URL" "$BG_URL"; do
-            echo "HEAD $U" && curl -I -L --max-redirs 5 "$U" | sed -n '1,5p' || true
-          done
           curl -fSL "$VOICE_URL" -o voice.mp3
           curl -fSL "$INTRO_URL" -o intro.mp3
           curl -fSL "$OUTRO_URL" -o outro.mp3
           curl -fSL "$BG_URL"    -o bg.mp3
           ls -lh
 
-      # === НОРМАЛИЗАЦИЯ И ПРИВЕДЕНИЕ К ЕДИНОМУ ФОРМАТУ ===
       - name: Normalize all to 44.1kHz stereo (WAV)
         run: |
           ffmpeg -y -i intro.mp3 -ac 2 -ar 44100 intro_fix.wav
           ffmpeg -y -i voice.mp3 -ac 2 -ar 44100 voice_fix.wav
           ffmpeg -y -i outro.mp3 -ac 2 -ar 44100 outro_fix.wav
           ffmpeg -y -i bg.mp3    -ac 2 -ar 44100 bg_fix.wav
-          ls -lh *_fix.wav
 
-      # === ПРИГЛУШЕНИЕ ИНТРО И АУТРО ===
       - name: Lower intro and outro volumes
         run: |
-          ffmpeg -y -i intro_fix.wav -filter:a "volume=-6dB" intro_quiet.wav
-          ffmpeg -y -i outro_fix.wav -filter:a "volume=-6dB" outro_quiet.wav
-          mv intro_quiet.wav intro_fix.wav
-          mv outro_quiet.wav outro_fix.wav
+          ffmpeg -y -i intro_fix.wav -filter:a "volume=-6dB" intro_fix.wav
+          ffmpeg -y -i outro_fix.wav -filter:a "volume=-6dB" outro_fix.wav
 
-      # === ФОН ПОД ДЛИНУ ГОЛОСА ===
       - name: Loop & trim background to voice duration
         env:
-          BG_DB: "-18"        # громкость подложки
+          BG_DB: "-10"        # громкость подложки (было -18)
         run: |
-          set -e
           VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice_fix.wav)
-          echo "Voice duration: $VDUR s"
           ffmpeg -y -stream_loop -1 -i bg_fix.wav -t "$VDUR" -af "volume=${BG_DB}dB" bg_cut.wav
 
-      # === СМЕШИВАНИЕ ГОЛОС + ФОН ===
-      - name: Mix voice + bg (duration=voice)
+      - name: Mix voice + bg
         env:
           VOICE_DB: "0"
         run: |
@@ -82,33 +70,27 @@ jobs:
             -filter_complex "[0:a]volume=${VOICE_DB}dB[a0];[a0][1:a]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
             -map "[aout]" -ar 44100 voice_mix.wav
 
-      # === КОНКАТЕНАЦИЯ ===
       - name: Concat intro + mixed + outro
         run: |
           ffmpeg -y -i intro_fix.wav -i voice_mix.wav -i outro_fix.wav \
             -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
             -map "[a]" -ar 44100 -b:a 160k result.mp3
-          ls -lh result.mp3
 
-      # === ВЫРАВНИВАНИЕ ГРОМКОСТИ ДО -16 LUFS ===
       - name: Loudness normalize to -16 LUFS
         run: |
           ffmpeg -y -i result.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k result_norm.mp3
           mv result_norm.mp3 result.mp3
 
-      # === ЗАГРУЗКА В CLOUDINARY (UNSIGNED PRESET) ===
       - name: Upload to Cloudinary (unsigned preset)
         env:
           CLD_CLOUD_NAME:    ${{ secrets.CLD_CLOUD_NAME }}
           CLD_UPLOAD_PRESET: ${{ secrets.CLD_UPLOAD_PRESET }}
         run: |
-          set -e
           curl -sS -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
             -F file=@result.mp3 \
             -F upload_preset=$CLD_UPLOAD_PRESET \
             -F folder=prokis \
             -o cld.json
-          cat cld.json
           URL=$(jq -r '.secure_url // empty' cld.json)
           if [ -z "$URL" ] || [ "$URL" = "null" ]; then
             echo "❌ Upload failed"; exit 1
