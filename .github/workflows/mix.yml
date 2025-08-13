@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       voice_url:
-        description: 'URL mp3 голоса (Cloudinary secure_url)'
+        description: 'URL mp3/wav с голосом (Cloudinary secure_url)'
         required: true
   repository_dispatch:
     types: [mix_audio]
@@ -19,22 +19,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
-      - name: Read payload (manual or dispatch)
+      - name: Get VOICE_URL
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "{\"voice_url\": \"${{ github.event.inputs.voice_url }}\"}" > payload.json
+            echo "VOICE_URL=${{ github.event.inputs.voice_url }}" >> $GITHUB_ENV
           else
-            echo '${{ toJson(github.event.client_payload) }}' > payload.json
+            echo "VOICE_URL=${{ github.event.client_payload.voice_url }}" >> $GITHUB_ENV
           fi
-          cat payload.json
-
-      - name: Resolve VOICE_URL
-        run: |
-          VOICE_URL=$(jq -r '.voice_url // empty' payload.json)
-          if [ -z "$VOICE_URL" ] || [ "$VOICE_URL" = "null" ]; then
-            echo "❌ VOICE_URL is empty"; exit 1
-          fi
-          echo "VOICE_URL=$VOICE_URL" >> $GITHUB_ENV
+          echo "VOICE_URL=$VOICE_URL"
 
       - name: Download input files
         env:
@@ -42,90 +34,61 @@ jobs:
           OUTRO_URL: ${{ secrets.OUTRO_URL }}
           BG_URL:    ${{ secrets.BG_URL }}
         run: |
-          set -e
-          if [ -z "$INTRO_URL" ] || [ -z "$OUTRO_URL" ] || [ -z "$BG_URL" ]; then
-            echo "❌ Missing INTRO_URL / OUTRO_URL / BG_URL secrets"; exit 1
-          fi
           curl -fSL "$VOICE_URL" -o voice.mp3
           curl -fSL "$INTRO_URL" -o intro.mp3
           curl -fSL "$OUTRO_URL" -o outro.mp3
           curl -fSL "$BG_URL"    -o bg.mp3
           ls -lh
 
-      # Привести всё к 44.1kHz stereo WAV
-      - name: Normalize all to 44.1kHz stereo (WAV)
+      - name: Convert all to WAV 44.1kHz stereo
         run: |
-          ffmpeg -y -i intro.mp3  -ar 44100 -ac 2 intro_fix.wav
-          ffmpeg -y -i outro.mp3  -ar 44100 -ac 2 outro_fix.wav
-          ffmpeg -y -i bg.mp3     -ar 44100 -ac 2 bg_fix.wav
-          ffmpeg -y -i voice.mp3  -ar 44100 -ac 2 voice_fix.wav
+          ffmpeg -y -i intro.mp3  -ar 44100 -ac 2 intro.wav
+          ffmpeg -y -i outro.mp3  -ar 44100 -ac 2 outro.wav
+          ffmpeg -y -i bg.mp3     -ar 44100 -ac 2 bg.wav
+          ffmpeg -y -i voice.mp3  -ar 44100 -ac 2 voice.wav
 
-      # Интро/аутро тише + мягкие фейды
-      - name: Lower intro and outro volumes (+fades)
+      - name: Lower intro and outro volumes
         run: |
-          ffmpeg -y -i intro_fix.wav -af "volume=-6dB,afade=t=in:d=0.4,areverse,afade=t=in:d=0.4,areverse" intro_fx.wav
-          mv intro_fx.wav intro_fix.wav
-          ffmpeg -y -i outro_fix.wav -af "volume=-6dB,afade=t=in:d=0.4,areverse,afade=t=in:d=0.4,areverse" outro_fx.wav
-          mv outro_fx.wav outro_fix.wav
+          ffmpeg -y -i intro.wav -af "volume=-6dB" intro_low.wav
+          ffmpeg -y -i outro.wav -af "volume=-6dB" outro_low.wav
 
-      # Подложка длиной ровно с голос
-      - name: Loop & trim background to voice duration
+      - name: Loop background to voice duration
         run: |
-          set -e
-          VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice_fix.wav)
-          ffmpeg -y -stream_loop -1 -i bg_fix.wav -t "$VDUR" bg_loop.wav
+          VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice.wav)
+          ffmpeg -y -stream_loop -1 -i bg.wav -t "$VDUR" bg_loop.wav
 
-      # Дакинг: фон −10 dB, EQ + sidechaincompress; голос +1.5 dB
-      - name: Mix voice + bg (sidechain ducking)
-        env:
-          VOICE_DB: "1.5"
-          BG_DB:   "-10"
+      - name: Mix voice and background (bg louder)
         run: |
-          ffmpeg -y -i voice_fix.wav -i bg_loop.wav \
-            -filter_complex "\
-              [1:a]volume=${BG_DB}dB,highpass=f=120,lowpass=f=8000[bg]; \
-              [0:a]volume=${VOICE_DB}dB[vc]; \
-              [bg][vc]sidechaincompress=threshold=0.1:ratio=8:attack=5:release=250:makeup=4:detection=peak[bgduck]; \
-              [vc][bgduck]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
+          ffmpeg -y -i voice.wav -i bg_loop.wav \
+            -filter_complex "[0:a]volume=2dB[voice];[1:a]volume=-14dB[bg];[voice][bg]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
             -map "[aout]" -ar 44100 -ac 2 voice_mix.wav
 
-      # Склейка интро + основная + аутро
       - name: Concat intro + mixed + outro
         run: |
-          ffmpeg -y -i intro_fix.wav -i voice_mix.wav -i outro_fix.wav \
+          ffmpeg -y -i intro_low.wav -i voice_mix.wav -i outro_low.wav \
             -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
             -map "[a]" -ar 44100 -b:a 160k result.mp3
-          ls -lh result.mp3
 
-      # Нормализация до −16 LUFS
       - name: Loudness normalize to -16 LUFS
         run: |
-          ffmpeg -y -i result.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k result_norm.mp3
-          mv result_norm.mp3 result.mp3
+          ffmpeg -y -i result.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k final.mp3
+          mv final.mp3 result.mp3
 
-      # Загрузка в Cloudinary (unsigned preset)
-      - name: Upload to Cloudinary (unsigned preset)
+      - name: Upload to Cloudinary
         env:
           CLD_CLOUD_NAME:    ${{ secrets.CLD_CLOUD_NAME }}
           CLD_UPLOAD_PRESET: ${{ secrets.CLD_UPLOAD_PRESET }}
         run: |
-          set -e
-          curl -sS -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
+          URL=$(curl -s -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
             -F file=@result.mp3 \
             -F upload_preset=$CLD_UPLOAD_PRESET \
-            -F folder=prokis \
-            -o cld.json
-          cat cld.json
-          URL=$(jq -r '.secure_url // empty' cld.json)
-          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-            echo "❌ Cloudinary unsigned upload failed"; exit 1
-          fi
+            -F folder=prokis | jq -r '.secure_url')
           echo "FINAL_URL=$URL" >> $GITHUB_ENV
-          echo "✅ Uploaded: $URL"
+          echo "Uploaded: $URL"
 
       - name: Callback to Make
         env:
           MAKE_CALLBACK_URL: ${{ secrets.MAKE_CALLBACK_URL }}
         run: |
-          curl -fSL -X POST -H "Content-Type: application/json" \
+          curl -s -X POST -H "Content-Type: application/json" \
             -d "{\"final_url\":\"$FINAL_URL\"}" "$MAKE_CALLBACK_URL"
