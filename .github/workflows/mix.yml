@@ -1,0 +1,74 @@
+name: MIXER
+on:
+  repository_dispatch:
+    types: [mix_audio]   # будем вызывать из Make через GitHub API
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install ffmpeg & jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq
+
+      - name: Read payload (voice url comes from Make)
+        run: |
+          echo '${{ toJson(github.event.client_payload) }}' > payload.json
+          cat payload.json
+
+      - name: Download input files
+        env:
+          INTRO_URL: ${{ secrets.INTRO_URL }}
+          OUTRO_URL: ${{ secrets.OUTRO_URL }}
+          BG_URL:    ${{ secrets.BG_URL }}
+        run: |
+          VOICE_URL=$(jq -r '.voice_url' payload.json)
+
+          curl -L "$VOICE_URL" -o voice.mp3
+          curl -L "$INTRO_URL" -o intro.mp3
+          curl -L "$OUTRO_URL" -o outro.mp3
+          curl -L "$BG_URL"    -o bg.mp3
+
+      - name: Mix voice + background (loop bg, adjust volumes)
+        env:
+          BG_DB: "-18"     # громкость подложки (можешь менять)
+          VOICE_DB: "0"    # усиление/ослабление голоса
+        run: |
+          # зацикливаем подложку, смешиваем с голосом, режем по длине голоса
+          ffmpeg -y -stream_loop -1 -i bg.mp3 -i voice.mp3 \
+            -filter_complex "[0:a]volume=${BG_DB}dB[bg];[bg][1:a]amix=inputs=2:duration=shortest:dropout_transition=2[m];[m]volume=${VOICE_DB}dB[out]" \
+            -map "[out]" -shortest -ar 44100 -b:a 128k voice_mix.mp3
+
+      - name: Concatenate intro + mix + outro
+        run: |
+          # попытка быстрым concat (copy), если не получится — через фильтр
+          printf "file 'intro.mp3'\nfile 'voice_mix.mp3'\nfile 'outro.mp3'\n" > list.txt
+          ffmpeg -y -f concat -safe 0 -i list.txt -c copy result.mp3 || \
+          ffmpeg -y -i intro.mp3 -i voice_mix.mp3 -i outro.mp3 \
+            -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[out]" \
+            -map "[out]" -ar 44100 -b:a 128k result.mp3
+
+      - name: Upload to Cloudinary
+        env:
+          CLD_CLOUD_NAME: ${{ secrets.CLD_CLOUD_NAME }}
+          CLD_API_KEY:    ${{ secrets.CLD_API_KEY }}
+          CLD_API_SECRET: ${{ secrets.CLD_API_SECRET }}
+        run: |
+          TS=$(date +%s)
+          curl -u "$CLD_API_KEY:$CLD_API_SECRET" \
+            -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
+            -F file=@result.mp3 \
+            -F public_id="prokis/mix_$TS" \
+            -F overwrite=true > cld.json
+          cat cld.json
+          URL=$(jq -r '.secure_url' cld.json)
+          echo "FINAL_URL=$URL" >> $GITHUB_ENV
+
+      - name: Callback to Make
+        env:
+          MAKE_CALLBACK_URL: ${{ secrets.MAKE_CALLBACK_URL }}
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"final_url\":\"$FINAL_URL\"}" "$MAKE_CALLBACK_URL"
