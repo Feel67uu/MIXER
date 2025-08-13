@@ -6,8 +6,11 @@ on:
       voice_url:
         description: 'URL mp3/wav с голосом (Cloudinary secure_url)'
         required: true
+      job_id:
+        description: 'Опционально: ID партии (для ручного запуска)'
+        required: false
   repository_dispatch:
-    types: [mix_audio]
+    types: [mix, mix_audio]
 
 jobs:
   build:
@@ -19,14 +22,41 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
-      - name: Get VOICE_URL
+      - name: Resolve inputs (VOICE_URL / JOB_ID / MAKE_CALLBACK_URL)
+        env:
+          SECRET_CALLBACK: ${{ secrets.MAKE_CALLBACK_URL }}
         run: |
+          set -e
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Ручной запуск
             echo "VOICE_URL=${{ github.event.inputs.voice_url }}" >> $GITHUB_ENV
+
+            if [ -n "${{ github.event.inputs.job_id }}" ]; then
+              echo "JOB_ID=${{ github.event.inputs.job_id }}" >> $GITHUB_ENV
+            else
+              echo "JOB_ID=$(date +%s)-$RANDOM" >> $GITHUB_ENV
+            fi
+
+            # Для ручного запуска колбэк берём из секрета
+            echo "MAKE_CALLBACK_URL=$SECRET_CALLBACK" >> $GITHUB_ENV
           else
+            # repository_dispatch
             echo "VOICE_URL=${{ github.event.client_payload.voice_url }}" >> $GITHUB_ENV
+            echo "JOB_ID=${{ github.event.client_payload.job_id }}" >> $GITHUB_ENV
+
+            # Сначала пробуем взять URL из payload; если пусто — из секрета
+            if [ -n "${{ github.event.client_payload.make_callback_url }}" ]; then
+              echo "MAKE_CALLBACK_URL=${{ github.event.client_payload.make_callback_url }}" >> $GITHUB_ENV
+            else
+              echo "MAKE_CALLBACK_URL=$SECRET_CALLBACK" >> $GITHUB_ENV
+            fi
           fi
-          echo "VOICE_URL=$VOICE_URL"
+
+          echo "Resolved:"
+          echo "  VOICE_URL=$VOICE_URL"
+          echo "  JOB_ID=$JOB_ID"
+          echo "  MAKE_CALLBACK_URL=$MAKE_CALLBACK_URL"
 
       - name: Download input files
         env:
@@ -34,6 +64,7 @@ jobs:
           OUTRO_URL: ${{ secrets.OUTRO_URL }}
           BG_URL:    ${{ secrets.BG_URL }}
         run: |
+          set -e
           curl -fSL "$VOICE_URL" -o voice.mp3
           curl -fSL "$INTRO_URL" -o intro.mp3
           curl -fSL "$OUTRO_URL" -o outro.mp3
@@ -42,6 +73,7 @@ jobs:
 
       - name: Convert all to WAV 44.1kHz stereo
         run: |
+          set -e
           ffmpeg -y -i intro.mp3  -ar 44100 -ac 2 intro.wav
           ffmpeg -y -i outro.mp3  -ar 44100 -ac 2 outro.wav
           ffmpeg -y -i bg.mp3     -ar 44100 -ac 2 bg.wav
@@ -49,36 +81,48 @@ jobs:
 
       - name: Lower intro and outro volumes
         run: |
+          set -e
           ffmpeg -y -i intro.wav -af "volume=-6dB" intro_low.wav
           ffmpeg -y -i outro.wav -af "volume=-6dB" outro_low.wav
 
       - name: Loop background to voice duration
         run: |
+          set -e
           VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice.wav)
           ffmpeg -y -stream_loop -1 -i bg.wav -t "$VDUR" bg_loop.wav
 
       - name: Mix voice and background (bg louder)
         run: |
+          set -e
           ffmpeg -y -i voice.wav -i bg_loop.wav \
             -filter_complex "[0:a]volume=2dB[voice];[1:a]volume=-14dB[bg];[voice][bg]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
             -map "[aout]" -ar 44100 -ac 2 voice_mix.wav
 
       - name: Concat intro + mixed + outro
         run: |
+          set -e
           ffmpeg -y -i intro_low.wav -i voice_mix.wav -i outro_low.wav \
             -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
-            -map "[a]" -ar 44100 -b:a 160k result.mp3
+            -map "[a]" -ar 44100 -b:a 160k result_premix.mp3
 
       - name: Loudness normalize to -16 LUFS
         run: |
-          ffmpeg -y -i result.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k final.mp3
-          mv final.mp3 result.mp3
+          set -e
+          ffmpeg -y -i result_premix.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k result.mp3
+
+      - name: Measure final duration
+        run: |
+          set -e
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 result.mp3)
+          echo "FINAL_DURATION=$DUR" >> $GITHUB_ENV
+          echo "Duration (s): $DUR"
 
       - name: Upload to Cloudinary
         env:
           CLD_CLOUD_NAME:    ${{ secrets.CLD_CLOUD_NAME }}
           CLD_UPLOAD_PRESET: ${{ secrets.CLD_UPLOAD_PRESET }}
         run: |
+          set -e
           URL=$(curl -s -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
             -F file=@result.mp3 \
             -F upload_preset=$CLD_UPLOAD_PRESET \
@@ -87,8 +131,16 @@ jobs:
           echo "Uploaded: $URL"
 
       - name: Callback to Make
-        env:
-          MAKE_CALLBACK_URL: ${{ secrets.MAKE_CALLBACK_URL }}
         run: |
+          set -e
+          echo "Callback -> $MAKE_CALLBACK_URL"
+          jq -n \
+            --arg job_id "$JOB_ID" \
+            --arg final_audio_url "$FINAL_URL" \
+            --arg lufs "-16" \
+            --arg duration "$FINAL_DURATION" \
+            '{job_id:$job_id, final_audio_url:$final_audio_url, lufs:$lufs, duration: ($duration|tonumber)}' \
+          | tee payload.json
+
           curl -s -X POST -H "Content-Type: application/json" \
-            -d "{\"final_url\":\"$FINAL_URL\"}" "$MAKE_CALLBACK_URL"
+            -d @payload.json "$MAKE_CALLBACK_URL"
