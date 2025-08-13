@@ -57,41 +57,38 @@ jobs:
           ffmpeg -y -i bg.mp3     -ar 44100 -ac 2 bg_fix.wav
           ffmpeg -y -i voice.mp3  -ar 44100 -ac 2 voice_fix.wav
 
-      # Интро/аутро тише и с мягкими фейдами (универсальный способ через реверс)
+      # Интро/аутро тише + мягкие фейды
       - name: Lower intro and outro volumes (+fades)
         run: |
-          # intro: -6 dB + fade in/out 0.4s
           ffmpeg -y -i intro_fix.wav -af "volume=-6dB,afade=t=in:d=0.4,areverse,afade=t=in:d=0.4,areverse" intro_fx.wav
           mv intro_fx.wav intro_fix.wav
-          # outro: -6 dB + fade in/out 0.4s
           ffmpeg -y -i outro_fix.wav -af "volume=-6dB,afade=t=in:d=0.4,areverse,afade=t=in:d=0.4,areverse" outro_fx.wav
           mv outro_fx.wav outro_fix.wav
 
       # Делаем фон длиной ровно с голос
       - name: Loop & trim background to voice duration
         env:
-          BG_TRIM_PAD: "0"   # можно оставить 0; если нужна тишина в конце, поставь 0.2..0.5
+          BG_TRIM_PAD: "0"
         run: |
           set -e
           VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice_fix.wav)
-          # на случай дробных значений используем точные секунды
           ffmpeg -y -stream_loop -1 -i bg_fix.wav -t "$VDUR" bg_loop.wav
 
-      # Микс с автодакингом: фон на -10 dB, EQ + sidechaincompressor, голос слегка приподнят
+      # Микс с автодакингом (ПРАВИЛЬНЫЙ фильтр: sidechaincompress)
       - name: Mix voice + bg (sidechain ducking)
         env:
-          VOICE_DB: "1.5"   # подними/понизь голос, если нужно (в дБ)
-          BG_DB:   "-10"    # базовый уровень фона до дакинга (в дБ)
+          VOICE_DB: "1.5"   # усиление голоса
+          BG_DB:   "-10"    # базовый уровень фона до дакинга
         run: |
           ffmpeg -y -i voice_fix.wav -i bg_loop.wav \
             -filter_complex "\
               [1:a]volume=${BG_DB}dB,highpass=f=120,lowpass=f=8000[bg]; \
               [0:a]volume=${VOICE_DB}dB[voice]; \
-              [bg][voice]sidechaincompressor=threshold=0.05:ratio=8:attack=5:release=250:makeup=0[bgduck]; \
+              [bg][voice]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=250:makeup=0[bgduck]; \
               [voice][bgduck]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
             -map "[aout]" -ar 44100 -ac 2 voice_mix.wav
 
-      # Склейка интро + основная часть + аутро
+      # Склейка
       - name: Concat intro + mixed + outro
         run: |
           ffmpeg -y -i intro_fix.wav -i voice_mix.wav -i outro_fix.wav \
@@ -112,9 +109,6 @@ jobs:
           CLD_UPLOAD_PRESET: ${{ secrets.CLD_UPLOAD_PRESET }}
         run: |
           set -e
-          if [ -z "$CLD_CLOUD_NAME" ] || [ -z "$CLD_UPLOAD_PRESET" ]; then
-            echo "❌ Missing CLD_CLOUD_NAME or CLD_UPLOAD_PRESET secrets"; exit 1
-          fi
           curl -sS -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
             -F file=@result.mp3 \
             -F upload_preset=$CLD_UPLOAD_PRESET \
