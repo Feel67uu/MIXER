@@ -1,5 +1,4 @@
 name: MIXER
-
 on:
   workflow_dispatch:            # ручной запуск из Actions
     inputs:
