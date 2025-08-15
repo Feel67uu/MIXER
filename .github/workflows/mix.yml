@@ -16,44 +16,56 @@ concurrency:
   group: mixer
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install ffmpeg & jq
+        shell: bash
         run: |
+          set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
-      # ====== РЕЗОЛВ ВХОДНЫХ ДАННЫХ (с защитой JOB_ID) ======
+      # ====== РЕЗОЛВ ВХОДНЫХ ДАННЫХ (с защитами) ======
       - name: Resolve inputs (VOICE_URL / JOB_ID / MAKE_CALLBACK_URL)
         env:
           SECRET_CALLBACK: ${{ secrets.MAKE_CALLBACK_URL }}
+        shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
-          # 1) Берём значения из источника события
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            [ -n "${{ github.event.inputs.voice_url }}" ] && VOICE_URL="${{ github.event.inputs.voice_url }}"
-            [ -n "${{ github.event.inputs.job_id }}" ] && JOB_ID="${{ github.event.inputs.job_id }}"
+          # 1) Источник события
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            [[ -n "${{ github.event.inputs.voice_url }}" ]] && VOICE_URL="${{ github.event.inputs.voice_url }}"
+            [[ -n "${{ github.event.inputs.job_id }}"   ]] && JOB_ID="${{ github.event.inputs.job_id }}"
             MAKE_CALLBACK_URL="$SECRET_CALLBACK"
           else
-            [ -n "${{ github.event.client_payload.voice_url }}" ] && VOICE_URL="${{ github.event.client_payload.voice_url }}"
-            [ -n "${{ github.event.client_payload.job_id }}" ] && JOB_ID="${{ github.event.client_payload.job_id }}"
-            if [ -n "${{ github.event.client_payload.make_callback_url }}" ]; then
+            # repo_dispatch
+            [[ -n "${{ github.event.client_payload.voice_url }}"       ]] && VOICE_URL="${{ github.event.client_payload.voice_url }}"
+            # fallback, если в payload прилетает другое имя
+            if [[ -z "${VOICE_URL:-}" && -n "${{ github.event.client_payload.final_audio_url }}" ]]; then
+              VOICE_URL="${{ github.event.client_payload.final_audio_url }}"
+            fi
+            [[ -n "${{ github.event.client_payload.job_id }}"         ]] && JOB_ID="${{ github.event.client_payload.job_id }}"
+            if [[ -n "${{ github.event.client_payload.make_callback_url }}" ]]; then
               MAKE_CALLBACK_URL="${{ github.event.client_payload.make_callback_url }}"
             else
               MAKE_CALLBACK_URL="$SECRET_CALLBACK"
             fi
           fi
 
-          # 2) Санитизируем/страхуем JOB_ID
+          # 2) Санитизация JOB_ID (и защита от дефолтного имени)
           JOB_ID="$(printf "%s" "${JOB_ID:-}" | tr -d '\r' | xargs | tr -cd '[:alnum:]_-')"
-          if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "prokis_jobs" ]; then
+          if [[ -z "$JOB_ID" || "$JOB_ID" == "prokis_jobs" ]]; then
             JOB_ID="$(date +%s)-$RANDOM"
           fi
 
@@ -62,7 +74,7 @@ jobs:
             echo "VOICE_URL=${VOICE_URL:-}"
             echo "JOB_ID=$JOB_ID"
             echo "MAKE_CALLBACK_URL=$MAKE_CALLBACK_URL"
-          } >> $GITHUB_ENV
+          } >> "$GITHUB_ENV"
 
           echo ">> Resolved"
           echo "   VOICE_URL=${VOICE_URL:-<empty>}"
@@ -70,6 +82,7 @@ jobs:
           echo "   MAKE_CALLBACK_URL=$(echo "$MAKE_CALLBACK_URL" | sed -E 's#^(https?://[^/]+).*#\1#')"
 
       - name: Debug client_payload (for repo_dispatch)
+        if: ${{ github.event_name == 'repository_dispatch' }}
         run: |
           echo 'client_payload JSON:'
           echo '${{ toJSON(github.event.client_payload) }}'
@@ -82,16 +95,17 @@ jobs:
           BG_URL:            ${{ secrets.BG_URL }}
           CLD_CLOUD_NAME:    ${{ secrets.CLD_CLOUD_NAME }}
           CLD_UPLOAD_PRESET: ${{ secrets.CLD_UPLOAD_PRESET }}
+        shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
           miss=0
           for k in INTRO_URL OUTRO_URL BG_URL CLD_CLOUD_NAME CLD_UPLOAD_PRESET; do
-            v="${!k}"
-            if [ -z "$v" ]; then
+            v="${!k:-}"
+            if [[ -z "$v" ]]; then
               echo "::error title=Missing secret::$k is empty or not configured"; miss=1
             fi
           done
-          [ $miss -ne 0 ] && { echo "Some secrets are missing. See errors above."; exit 1; }
+          [[ $miss -ne 0 ]] && { echo "Some secrets are missing. See errors above."; exit 1; }
           echo "All required secrets are present."
 
       # ====== ВАЛИДАЦИЯ URL-ОВ ======
@@ -100,17 +114,18 @@ jobs:
           INTRO_URL_RAW: ${{ secrets.INTRO_URL }}
           OUTRO_URL_RAW: ${{ secrets.OUTRO_URL }}
           BG_URL_RAW:    ${{ secrets.BG_URL }}
+        shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
           trim(){ printf "%s" "$1" | tr -d '\r' | xargs; }
 
-          VOICE_URL="$(trim "$VOICE_URL")"
+          VOICE_URL="$(trim "${VOICE_URL:-}")"
           INTRO_URL="$(trim "$INTRO_URL_RAW")"
           OUTRO_URL="$(trim "$OUTRO_URL_RAW")"
           BG_URL="$(trim "$BG_URL_RAW")"
           MAKE_CALLBACK_URL="$(trim "$MAKE_CALLBACK_URL")"
 
-          req_url(){ [ -z "$2" ] && { echo "::error title=$1 missing::Set $1"; exit 1; }
+          req_url(){ [[ -z "$2" ]] && { echo "::error title=$1 missing::Set $1"; exit 1; }
                      echo "$2" | grep -qi '^https\?://' || { echo "::error title=$1 invalid::Must start with http/https"; exit 1; }; }
 
           req_url "VOICE_URL" "$VOICE_URL"
@@ -125,85 +140,102 @@ jobs:
             echo "OUTRO_URL=$OUTRO_URL"
             echo "BG_URL=$BG_URL"
             echo "MAKE_CALLBACK_URL=$MAKE_CALLBACK_URL"
-          } >> $GITHUB_ENV
+          } >> "$GITHUB_ENV"
 
           echo "VOICE_URL host: $(echo "$VOICE_URL" | sed -E 's#^(https?://[^/]+).*#\1#')/…"
           echo "Callback host: $(echo "$MAKE_CALLBACK_URL" | sed -E 's#^(https?://[^/]+).*#\1#')"
 
       # ====== АУДИО-ПАЙПЛАЙН ======
       - name: Download input files
+        shell: bash
         run: |
-          set -e
-          curl -fSL "$VOICE_URL" -o voice.mp3
+          set -Eeuo pipefail
+          curl -fSL "$VOICE_URL" -o voice_input
           curl -fSL "$INTRO_URL" -o intro.mp3
           curl -fSL "$OUTRO_URL" -o outro.mp3
           curl -fSL "$BG_URL"    -o bg.mp3
           ls -lh
 
-      - name: Convert all to WAV 44.1kHz stereo
+      - name: Validate audio stream (voice)
+        shell: bash
         run: |
-          set -e
-          ffmpeg -y -i intro.mp3  -ar 44100 -ac 2 intro.wav
-          ffmpeg -y -i outro.mp3  -ar 44100 -ac 2 outro.wav
-          ffmpeg -y -i bg.mp3     -ar 44100 -ac 2 bg.wav
-          ffmpeg -y -i voice.mp3  -ar 44100 -ac 2 voice.wav
+          set -Eeuo pipefail
+          # ffprobe вернёт код ошибки, если нет аудио-потоков
+          ffprobe -hide_banner -loglevel error -select_streams a:0 -show_streams -of csv=p=0 voice_input
+
+      - name: Convert all to WAV 44.1kHz stereo
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ffmpeg -hide_banner -y -i intro.mp3     -ar 44100 -ac 2 intro.wav
+          ffmpeg -hide_banner -y -i outro.mp3     -ar 44100 -ac 2 outro.wav
+          ffmpeg -hide_banner -y -i bg.mp3        -ar 44100 -ac 2 bg.wav
+          ffmpeg -hide_banner -y -i voice_input   -ar 44100 -ac 2 voice.wav
 
       - name: Lower intro and outro volumes
+        shell: bash
         run: |
-          set -e
-          ffmpeg -y -i intro.wav -af "volume=-6dB" intro_low.wav
-          ffmpeg -y -i outro.wav -af "volume=-6dB" outro_low.wav
+          set -Eeuo pipefail
+          ffmpeg -hide_banner -y -i intro.wav -af "volume=-6dB" intro_low.wav
+          ffmpeg -hide_banner -y -i outro.wav -af "volume=-6dB" outro_low.wav
 
       - name: Loop background to voice duration
+        shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
           VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice.wav)
-          ffmpeg -y -stream_loop -1 -i bg.wav -t "$VDUR" bg_loop.wav
+          ffmpeg -hide_banner -y -stream_loop -1 -i bg.wav -t "$VDUR" bg_loop.wav
 
       - name: Mix voice and background (bg louder)
+        shell: bash
         run: |
-          set -e
-          ffmpeg -y -i voice.wav -i bg_loop.wav \
+          set -Eeuo pipefail
+          ffmpeg -hide_banner -y -i voice.wav -i bg_loop.wav \
             -filter_complex "[0:a]volume=2dB[voice];[1:a]volume=-14dB[bg];[voice][bg]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
             -map "[aout]" -ar 44100 -ac 2 voice_mix.wav
 
       - name: Concat intro + mixed + outro
+        shell: bash
         run: |
-          set -e
-          ffmpeg -y -i intro_low.wav -i voice_mix.wav -i outro_low.wav \
+          set -Eeuo pipefail
+          ffmpeg -hide_banner -y -i intro_low.wav -i voice_mix.wav -i outro_low.wav \
             -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
             -map "[a]" -ar 44100 -b:a 160k result_premix.mp3
 
       - name: Loudness normalize to -16 LUFS
+        shell: bash
         run: |
-          set -e
-          ffmpeg -y -i result_premix.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k result.mp3
+          set -Eeuo pipefail
+          ffmpeg -hide_banner -y -i result_premix.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k result.mp3
 
       - name: Measure final duration
+        shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
           DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 result.mp3)
-          echo "FINAL_DURATION=$DUR" >> $GITHUB_ENV
+          echo "FINAL_DURATION=$DUR" >> "$GITHUB_ENV"
           echo "Duration (s): $DUR"
 
-      - name: Upload to Cloudinary
+      - name: Upload to Cloudinary (video resource type for audio)
         env:
           CLD_CLOUD_NAME:    ${{ secrets.CLD_CLOUD_NAME }}
           CLD_UPLOAD_PRESET: ${{ secrets.CLD_UPLOAD_PRESET }}
+        shell: bash
         run: |
-          set -e
-          URL=$(curl -s -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/auto/upload" \
+          set -Eeuo pipefail
+          URL=$(curl -s -X POST "https://api.cloudinary.com/v1_1/$CLD_CLOUD_NAME/video/upload" \
             -F file=@result.mp3 \
-            -F upload_preset=$CLD_UPLOAD_PRESET \
+            -F upload_preset="$CLD_UPLOAD_PRESET" \
             -F folder=prokis | jq -r '.secure_url')
-          [ -z "$URL" -o "$URL" = "null" ] && { echo "::error title=Cloudinary::Upload failed"; exit 1; }
-          echo "FINAL_URL=$URL" >> $GITHUB_ENV
+          [[ -z "$URL" || "$URL" == "null" ]] && { echo "::error title=Cloudinary::Upload failed"; exit 1; }
+          echo "FINAL_URL=$URL" >> "$GITHUB_ENV"
           echo "Uploaded: $URL"
 
       # ====== КОЛБЭК В MAKE (job_id+final_audio_url+метрики) ======
       - name: Callback to Make
+        shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
           echo "Callback -> $MAKE_CALLBACK_URL"
 
           jq -n \
