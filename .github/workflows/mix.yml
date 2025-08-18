@@ -43,15 +43,12 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          # 1) Источник события
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             [[ -n "${{ github.event.inputs.voice_url }}" ]] && VOICE_URL="${{ github.event.inputs.voice_url }}"
             [[ -n "${{ github.event.inputs.job_id }}"   ]] && JOB_ID="${{ github.event.inputs.job_id }}"
             MAKE_CALLBACK_URL="$SECRET_CALLBACK"
           else
-            # repo_dispatch
             [[ -n "${{ github.event.client_payload.voice_url }}"       ]] && VOICE_URL="${{ github.event.client_payload.voice_url }}"
-            # fallback, если в payload прилетает другое имя
             if [[ -z "${VOICE_URL:-}" && -n "${{ github.event.client_payload.final_audio_url }}" ]]; then
               VOICE_URL="${{ github.event.client_payload.final_audio_url }}"
             fi
@@ -63,13 +60,11 @@ jobs:
             fi
           fi
 
-          # 2) Санитизация JOB_ID (и защита от дефолтного имени)
           JOB_ID="$(printf "%s" "${JOB_ID:-}" | tr -d '\r' | xargs | tr -cd '[:alnum:]_-')"
           if [[ -z "$JOB_ID" || "$JOB_ID" == "prokis_jobs" ]]; then
             JOB_ID="$(date +%s)-$RANDOM"
           fi
 
-          # 3) Публикуем в окружение
           {
             echo "VOICE_URL=${VOICE_URL:-}"
             echo "JOB_ID=$JOB_ID"
@@ -160,19 +155,18 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # ffprobe вернёт код ошибки, если нет аудио-потоков
           ffprobe -hide_banner -loglevel error -select_streams a:0 -show_streams -of csv=p=0 voice_input
 
       - name: Convert all to WAV 44.1kHz stereo
         shell: bash
         run: |
           set -Eeuo pipefail
-          ffmpeg -hide_banner -y -i intro.mp3     -ar 44100 -ac 2 intro.wav
-          ffmpeg -hide_banner -y -i outro.mp3     -ar 44100 -ac 2 outro.wav
-          ffmpeg -hide_banner -y -i bg.mp3        -ar 44100 -ac 2 bg.wav
-          ffmpeg -hide_banner -y -i voice_input   -ar 44100 -ac 2 voice.wav
+          ffmpeg -hide_banner -y -i intro.mp3   -ar 44100 -ac 2 intro.wav
+          ffmpeg -hide_banner -y -i outro.mp3   -ar 44100 -ac 2 outro.wav
+          ffmpeg -hide_banner -y -i bg.mp3      -ar 44100 -ac 2 bg.wav
+          ffmpeg -hide_banner -y -i voice_input -ar 44100 -ac 2 voice.wav
 
-      # === НОВОЕ: нормализация интро/BG/аутро к одной громкости ===
+      # === НОВОЕ: нормализация интро/BG/аутро к одной громкости
       - name: Normalize intro/bg/outro to one loudness
         env:
           TARGET_LUFS: "-16"
@@ -183,8 +177,6 @@ jobs:
           ffmpeg -hide_banner -y -i bg.wav    -af "loudnorm=I=$TARGET_LUFS:TP=$TRUE_PEAK:LRA=11" -ar 44100 -ac 2 bg_n.wav
           ffmpeg -hide_banner -y -i outro.wav -af "loudnorm=I=$TARGET_LUFS:TP=$TRUE_PEAK:LRA=11" -ar 44100 -ac 2 outro_n.wav
 
-      # (старый шаг по занижению громкости интро/аутро удалён)
-
       - name: Loop normalized BG to voice duration
         run: |
           set -Eeuo pipefail
@@ -193,25 +185,34 @@ jobs:
 
       - name: Mix voice and normalized BG
         env:
-          BG_MIX_DB: "-4"   # 0 = ровно с голосом; -3..-6 dB = чуть тише под речь
+          BG_MIX_DB: "-4"   # 0 = ровно с голосом; -3..-6 dB = тише под речь
         run: |
           set -Eeuo pipefail
           ffmpeg -hide_banner -y -i voice.wav -i bg_loop.wav \
             -filter_complex "[1:a]volume=${BG_MIX_DB}dB[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]" \
             -map "[aout]" -ar 44100 -ac 2 voice_mix.wav
 
-      - name: Concat intro + mixed + outro (normalized parts)
+      # === НОВОЕ: Нормализуем voice+BG к тому же -16 LUFS
+      - name: Normalize voice_mix to same loudness
+        env:
+          TARGET_LUFS: "-16"
+          TRUE_PEAK:   "-1.5"
         run: |
           set -Eeuo pipefail
-          ffmpeg -hide_banner -y -i intro_n.wav -i voice_mix.wav -i outro_n.wav \
-            -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
-            -map "[a]" -ar 44100 -b:a 160k result_premix.mp3
+          ffmpeg -hide_banner -y -i voice_mix.wav -af "loudnorm=I=$TARGET_LUFS:TP=$TRUE_PEAK:LRA=11" -ar 44100 -ac 2 voice_mix_n.wav
 
-      - name: Loudness normalize to -16 LUFS
-        shell: bash
+      - name: Concat intro + voice_mix + outro (all normalized)
         run: |
           set -Eeuo pipefail
-          ffmpeg -hide_banner -y -i result_premix.mp3 -filter:a "loudnorm=I=-16:TP=-1.5:LRA=11" -ar 44100 -b:a 160k result.mp3
+          ffmpeg -hide_banner -y -i intro_n.wav -i voice_mix_n.wav -i outro_n.wav \
+            -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
+            -map "[a]" -ar 44100 result_premix.wav
+
+      # финальный лимитер (легко), без повторной глобальной нормализации
+      - name: Peak limit and encode MP3
+        run: |
+          set -Eeuo pipefail
+          ffmpeg -hide_banner -y -i result_premix.wav -af "alimiter=limit=0.98" -ar 44100 -b:a 160k result.mp3
 
       - name: Measure final duration
         shell: bash
@@ -236,7 +237,6 @@ jobs:
           echo "FINAL_URL=$URL" >> "$GITHUB_ENV"
           echo "Uploaded: $URL"
 
-      # ====== КОЛБЭК В MAKE (job_id+final_audio_url+метрики) ======
       - name: Callback to Make
         shell: bash
         run: |
