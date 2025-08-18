@@ -172,33 +172,38 @@ jobs:
           ffmpeg -hide_banner -y -i bg.mp3        -ar 44100 -ac 2 bg.wav
           ffmpeg -hide_banner -y -i voice_input   -ar 44100 -ac 2 voice.wav
 
-      - name: Lower intro and outro volumes
-        shell: bash
+      # === НОВОЕ: нормализация интро/BG/аутро к одной громкости ===
+      - name: Normalize intro/bg/outro to one loudness
+        env:
+          TARGET_LUFS: "-16"
+          TRUE_PEAK:   "-1.5"
         run: |
           set -Eeuo pipefail
-          ffmpeg -hide_banner -y -i intro.wav -af "volume=-6dB" intro_low.wav
-          ffmpeg -hide_banner -y -i outro.wav -af "volume=-6dB" outro_low.wav
+          ffmpeg -hide_banner -y -i intro.wav -af "loudnorm=I=$TARGET_LUFS:TP=$TRUE_PEAK:LRA=11" -ar 44100 -ac 2 intro_n.wav
+          ffmpeg -hide_banner -y -i bg.wav    -af "loudnorm=I=$TARGET_LUFS:TP=$TRUE_PEAK:LRA=11" -ar 44100 -ac 2 bg_n.wav
+          ffmpeg -hide_banner -y -i outro.wav -af "loudnorm=I=$TARGET_LUFS:TP=$TRUE_PEAK:LRA=11" -ar 44100 -ac 2 outro_n.wav
 
-      - name: Loop background to voice duration
-        shell: bash
+      # (старый шаг по занижению громкости интро/аутро удалён)
+
+      - name: Loop normalized BG to voice duration
         run: |
           set -Eeuo pipefail
           VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 voice.wav)
-          ffmpeg -hide_banner -y -stream_loop -1 -i bg.wav -t "$VDUR" bg_loop.wav
+          ffmpeg -hide_banner -y -stream_loop -1 -i bg_n.wav -t "$VDUR" bg_loop.wav
 
-      - name: Mix voice and background (bg louder)
-        shell: bash
+      - name: Mix voice and normalized BG
+        env:
+          BG_MIX_DB: "-4"   # 0 = ровно с голосом; -3..-6 dB = чуть тише под речь
         run: |
           set -Eeuo pipefail
           ffmpeg -hide_banner -y -i voice.wav -i bg_loop.wav \
-            -filter_complex "[0:a]volume=2dB[voice];[1:a]volume=-14dB[bg];[voice][bg]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1:first_pts=0[aout]" \
+            -filter_complex "[1:a]volume=${BG_MIX_DB}dB[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]" \
             -map "[aout]" -ar 44100 -ac 2 voice_mix.wav
 
-      - name: Concat intro + mixed + outro
-        shell: bash
+      - name: Concat intro + mixed + outro (normalized parts)
         run: |
           set -Eeuo pipefail
-          ffmpeg -hide_banner -y -i intro_low.wav -i voice_mix.wav -i outro_low.wav \
+          ffmpeg -hide_banner -y -i intro_n.wav -i voice_mix.wav -i outro_n.wav \
             -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
             -map "[a]" -ar 44100 -b:a 160k result_premix.mp3
 
