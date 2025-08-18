@@ -166,7 +166,7 @@ jobs:
           ffmpeg -hide_banner -y -i bg.mp3      -ar 44100 -ac 2 bg.wav
           ffmpeg -hide_banner -y -i voice_input -ar 44100 -ac 2 voice.wav
 
-      # === НОВОЕ: нормализация интро/BG/аутро к одной громкости
+      # === ДОАЛЬШЕ — ТВОИ ТЕКУЩИЕ ШАГИ (не менял) ===
       - name: Normalize intro/bg/outro to one loudness
         env:
           TARGET_LUFS: "-16"
@@ -185,14 +185,13 @@ jobs:
 
       - name: Mix voice and normalized BG
         env:
-          BG_MIX_DB: "-4"   # 0 = ровно с голосом; -3..-6 dB = тише под речь
+          BG_MIX_DB: "-4"
         run: |
           set -Eeuo pipefail
           ffmpeg -hide_banner -y -i voice.wav -i bg_loop.wav \
             -filter_complex "[1:a]volume=${BG_MIX_DB}dB[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]" \
             -map "[aout]" -ar 44100 -ac 2 voice_mix.wav
 
-      # === НОВОЕ: Нормализуем voice+BG к тому же -16 LUFS
       - name: Normalize voice_mix to same loudness
         env:
           TARGET_LUFS: "-16"
@@ -208,11 +207,35 @@ jobs:
             -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]" \
             -map "[a]" -ar 44100 result_premix.wav
 
-      # финальный лимитер (легко), без повторной глобальной нормализации
-      - name: Peak limit and encode MP3
+      # === НОВОЕ: скачать и подготовить обложку ===
+      - name: Download & prep cover
+        env:
+          COVER_URL: "https://res.cloudinary.com/dmqm0r7oc/image/upload/v1755362995/prokis_overlay_512_nkgf5y.png"
         run: |
           set -Eeuo pipefail
-          ffmpeg -hide_banner -y -i result_premix.wav -af "alimiter=limit=0.98" -ar 44100 -b:a 160k result.mp3
+          curl -fSL "$COVER_URL" -o cover_src
+          # приводим к JPG 512x512 (белая подложка на случай прозрачности)
+          ffmpeg -hide_banner -y -i cover_src \
+            -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=white" \
+            -q:v 2 cover.jpg
+
+      # === НОВОЕ: кодируем MP3 с вшитой обложкой и ID3-тегами (без лимитера/нормализации) ===
+      - name: Encode MP3 with cover + ID3
+        env:
+          TRACK_TITLE: "Аудио-версия"
+          TRACK_PERFORMER: "ПроКис СВЕЖАК"
+          TRACK_ALBUM: "ПроКис: Новости"
+        run: |
+          set -Eeuo pipefail
+          ffmpeg -hide_banner -y -i result_premix.wav -i cover.jpg \
+            -map 0:a -map 1:v \
+            -ar 44100 -c:a libmp3lame -b:a 160k -id3v2_version 3 \
+            -metadata title="$TRACK_TITLE" \
+            -metadata artist="$TRACK_PERFORMER" \
+            -metadata album="$TRACK_ALBUM" \
+            -metadata date="$(date +%Y-%m-%d)" \
+            -disposition:v attached_pic \
+            result.mp3
 
       - name: Measure final duration
         shell: bash
